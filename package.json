@@ -1,0 +1,75 @@
+{
+  "name": "still",
+  "private": true,
+  "version": "1.0.0-beta.1",
+  "type": "module",
+  "main": "electron/main.mjs",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "dist": "npm run build && electron-builder --win",
+    "pack": "npm run build && electron-builder --dir"
+  },
+  "build": {
+    "appId": "com.still.player",
+    "productName": "Still",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "logo/**/*",
+      "package.json"
+    ],
+    "win": {
+      "icon": "logo/Still_logo_white/Still_logo_white_rounded.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
+  "dependencies": {
+    "@material/web": "^2.4.1",
+    "@types/jsmediatags": "^3.9.6",
+    "clsx": "2.1.1",
+    "framer-motion": "^12.38.0",
+    "jsmediatags": "^3.9.7",
+    "music-metadata": "^11.12.3",
+    "music-metadata-browser": "^2.5.11",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "tailwind-merge": "3.4.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.1.17",
+    "@types/node": "^22.0.0",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "5.1.1",
+    "electron": "^41.1.1",
+    "electron-builder": "^26.15.3",
+    "tailwindcss": "4.1.17",
+    "typescript": "5.9.3",
+    "vite": "7.2.4",
+    "vite-plugin-singlefile": "2.3.0"
+  }
+}
