@@ -1,6 +1,6 @@
 <div align="center">
 
-<image src="logo/Still_logo/Still_logo.png" height="64" width="64"/>
+<image src="logo/Still_logo/Still_logo.png" height="256" width="256"/>
 
 <h1>Still</h1>
 <h2>静听</h2>
