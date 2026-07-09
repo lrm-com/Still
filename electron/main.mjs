@@ -2,6 +2,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { parseFile } from "music-metadata";
 
@@ -12,12 +13,16 @@ const APP_ID = "com.still.player";
 const APP_ICON_PATH = path.join(__dirname, "../logo/Still_logo_white/Still_logo_white_rounded.ico");
 const AUDIO_EXTENSIONS = new Set([".mp3", ".flac", ".wav", ".ogg", ".m4a", ".aac"]);
 const STORE_FILE = "still-library.json";
+const METADATA_CACHE_FILE = "still-metadata-cache.json";
+const COVER_CACHE_DIR = "cover-cache";
+const IMPORT_CONCURRENCY = Math.max(2, Math.min(4, Number(process.env.STILL_IMPORT_CONCURRENCY || 4)));
 
 app.setName(APP_NAME);
 if (process.platform === "win32") app.setAppUserModelId(APP_ID);
 
 let mainWindow = null;
 let desktopLyricWindow = null;
+let desktopLyricLockedState = false;
 let tray = null;
 let isQuitting = false;
 const thumbarIconCache = new Map();
@@ -33,20 +38,102 @@ let lastPlayerState = {
   desktopLyricOpen: false
 };
 
-function getMimeByExt(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
-  if (ext === ".png") return "image/png";
-  if (ext === ".webp") return "image/webp";
-  if (ext === ".gif") return "image/gif";
-  return "image/jpeg";
+function fileUrlFromPath(filePath) {
+  const normalized = filePath.replace(/\\/g, "/");
+  const withLeading = normalized.startsWith("/") ? normalized : `/${normalized}`;
+  return encodeURI(`file://${withLeading}`);
 }
 
-function bufferToDataUrl(buffer, mime) {
+function filePathFromFileUrl(fileUrl) {
+  const url = new URL(fileUrl);
+  let filePath = decodeURIComponent(url.pathname);
+  if (process.platform === "win32" && /^\/[A-Za-z]:/.test(filePath)) filePath = filePath.slice(1);
+  return filePath;
+}
+
+async function imageSourceToDataUrl(source, target = 512) {
+  if (!source || typeof source !== "string") return "";
+  if (source.startsWith("data:")) return source;
+  let buffer;
+  try {
+    if (source.startsWith("file://")) {
+      buffer = await fs.readFile(filePathFromFileUrl(source));
+    } else if (path.isAbsolute(source)) {
+      buffer = await fs.readFile(source);
+    } else {
+      return source;
+    }
+  } catch {
+    return "";
+  }
+  const image = nativeImage.createFromBuffer(buffer);
+  if (image.isEmpty()) return "";
+  const size = image.getSize();
+  const maxSide = Math.max(size.width, size.height);
+  const resized = maxSide > target
+    ? image.resize({
+        width: Math.max(1, Math.round(size.width * (target / maxSide))),
+        height: Math.max(1, Math.round(size.height * (target / maxSide))),
+        quality: "best"
+      })
+    : image;
+  return resized.toDataURL();
+}
+
+function imageBufferToDataUrl(buffer, target = 1600) {
+  const image = nativeImage.createFromBuffer(buffer);
+  if (image.isEmpty()) return "";
+  const size = image.getSize();
+  const maxSide = Math.max(size.width, size.height);
+  const resized = maxSide > target
+    ? image.resize({
+        width: Math.max(1, Math.round(size.width * (target / maxSide))),
+        height: Math.max(1, Math.round(size.height * (target / maxSide))),
+        quality: "best"
+      })
+    : image;
+  return resized.toDataURL();
+}
+
+async function resolveCurrentCover(source, audioPath) {
+  if (audioPath && typeof audioPath === "string") {
+    try {
+      const metadata = await parseFile(audioPath, { skipCovers: false, duration: false });
+      const picture = metadata.common.picture?.[0];
+      if (picture?.data?.length) {
+        const dataUrl = imageBufferToDataUrl(Buffer.from(picture.data), 1600);
+        if (dataUrl) return dataUrl;
+      }
+    } catch {
+      // Fall back to cached or folder artwork when the audio file cannot be read.
+    }
+    try {
+      const folderCover = await readFolderCover(audioPath);
+      const folderDataUrl = await imageSourceToDataUrl(folderCover, 1600);
+      if (folderDataUrl) return folderDataUrl;
+    } catch {
+      // Ignore missing folder cover.
+    }
+  }
+  return imageSourceToDataUrl(source, 1600);
+}
+
+function hashText(value) {
+  return createHash("sha1").update(value).digest("hex");
+}
+
+async function getCoverCacheDir() {
+  const dir = path.join(app.getPath("userData"), COVER_CACHE_DIR);
+  await fs.mkdir(dir, { recursive: true });
+  return dir;
+}
+
+async function bufferToCoverUrl(buffer, mime, cacheKey) {
   const image = nativeImage.createFromBuffer(buffer);
   if (!image.isEmpty()) {
     const size = image.getSize();
     const maxSide = Math.max(size.width, size.height);
-    const target = 1024;
+    const target = 384;
     const resized = maxSide > target
       ? image.resize({
           width: Math.max(1, Math.round(size.width * (target / maxSide))),
@@ -54,9 +141,22 @@ function bufferToDataUrl(buffer, mime) {
           quality: "best"
         })
       : image;
-    return resized.toDataURL();
+    const out = resized.toJPEG(82);
+    const coverDir = await getCoverCacheDir();
+    const coverPath = path.join(coverDir, `${hashText(`${cacheKey}:${out.length}`)}.jpg`);
+    await fs.writeFile(coverPath, out).catch(async (error) => {
+      if (error?.code !== "EEXIST") throw error;
+    });
+    return fileUrlFromPath(coverPath);
   }
+  if (buffer.length > 96 * 1024) return undefined;
   return `data:${mime};base64,${buffer.toString("base64")}`;
+}
+
+async function dataUrlToCoverUrl(dataUrl, cacheKey) {
+  const match = String(dataUrl || "").match(/^data:([^;,]+);base64,(.+)$/);
+  if (!match) return undefined;
+  return bufferToCoverUrl(Buffer.from(match[2], "base64"), match[1], cacheKey);
 }
 
 function normalizeTagText(value) {
@@ -175,8 +275,8 @@ async function readFolderCover(filePath) {
   for (const name of names) {
     const fullPath = path.join(dir, name);
     try {
-      const buf = await fs.readFile(fullPath);
-      if (buf.length) return bufferToDataUrl(buf, getMimeByExt(fullPath));
+      const stat = await fs.stat(fullPath);
+      if (stat.size) return fileUrlFromPath(fullPath);
     } catch {
       // Ignore missing cover.
     }
@@ -204,9 +304,46 @@ async function collectAudioFiles(rootDir) {
   return result;
 }
 
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function getMetadataCachePath() {
+  const dir = app.getPath("userData");
+  await fs.mkdir(dir, { recursive: true });
+  return path.join(dir, METADATA_CACHE_FILE);
+}
+
+async function readMetadataCache() {
+  try {
+    const raw = await fs.readFile(await getMetadataCachePath(), "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed?.version === 1 && parsed.tracks && typeof parsed.tracks === "object") return parsed;
+  } catch {
+    // Cache misses are expected on first run.
+  }
+  return { version: 1, tracks: {} };
+}
+
+async function writeMetadataCache(cache) {
+  await fs.writeFile(await getMetadataCachePath(), JSON.stringify(cache), "utf8").catch(() => {});
+}
+
 async function importAudioPaths(inputPaths) {
   const roots = Array.from(new Set((inputPaths || []).filter(Boolean)));
   const tracks = [];
+  const metadataCache = await readMetadataCache();
+  let cacheChanged = false;
   for (const inputPath of roots) {
     let stat;
     try {
@@ -222,20 +359,36 @@ async function importAudioPaths(inputPaths) {
         : [];
     const rootDir = stat.isDirectory() ? inputPath : path.dirname(inputPath);
 
-    for (const audioPath of audioFiles) {
-      const metadata = await parseMetadataFromPath(audioPath);
-      tracks.push({
+    const imported = await mapWithConcurrency(audioFiles, IMPORT_CONCURRENCY, async (audioPath) => {
+      const fileStat = await fs.stat(audioPath).catch(() => null);
+      if (!fileStat) return null;
+      const cacheKey = path.resolve(audioPath);
+      const cached = metadataCache.tracks[cacheKey];
+      const metadata = cached?.size === fileStat.size && cached?.modifiedAt === fileStat.mtimeMs
+        ? cached.metadata
+        : await parseMetadataFromPath(audioPath, fileStat);
+      if (!cached || cached.size !== fileStat.size || cached.modifiedAt !== fileStat.mtimeMs) {
+        metadataCache.tracks[cacheKey] = {
+          size: fileStat.size,
+          modifiedAt: fileStat.mtimeMs,
+          metadata
+        };
+        cacheChanged = true;
+      }
+      return {
         localPath: audioPath,
         relativePath: path.relative(rootDir, audioPath),
         ...metadata
-      });
-    }
+      };
+    });
+    tracks.push(...imported.filter(Boolean));
   }
+  if (cacheChanged) await writeMetadataCache(metadataCache);
   return tracks;
 }
 
-async function parseMetadataFromPath(filePath) {
-  const fileStat = await fs.stat(filePath).catch(() => null);
+async function parseMetadataFromPath(filePath, knownFileStat) {
+  const fileStat = knownFileStat || await fs.stat(filePath).catch(() => null);
   const fileInfo = {
     fileSize: fileStat?.size,
     modifiedAt: fileStat?.mtimeMs,
@@ -266,11 +419,12 @@ async function parseMetadataFromPath(filePath) {
     const nativeTrack = pickNativeTag(meta.native, ["TRACKNUMBER", "TRCK", "TRACK"]);
     const nativeYear = pickNativeTag(meta.native, ["DATE", "YEAR", "TYER", "TDRC"]);
 
+    const coverCacheKey = `${filePath}:${fileInfo.modifiedAt || 0}:${fileInfo.fileSize || 0}`;
     let coverDataUrl;
     if (embeddedPicture?.data?.length && embeddedPicture.format) {
-      coverDataUrl = bufferToDataUrl(Buffer.from(embeddedPicture.data), embeddedPicture.format);
+      coverDataUrl = await bufferToCoverUrl(Buffer.from(embeddedPicture.data), embeddedPicture.format, coverCacheKey);
     } else if (typeof nativeCoverTag === "string" && nativeCoverTag.startsWith("data:")) {
-      coverDataUrl = nativeCoverTag;
+      coverDataUrl = await dataUrlToCoverUrl(nativeCoverTag, coverCacheKey);
     } else {
       coverDataUrl = await readFolderCover(filePath);
     }
@@ -492,6 +646,7 @@ function updateTaskbarControls() {
 }
 
 function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) createWindow();
   if (!mainWindow) return;
   mainWindow.show();
   if (mainWindow.isMinimized()) mainWindow.restore();
@@ -502,9 +657,23 @@ function showMainWindow() {
   }
 }
 
-function sendPlayerCommand(command) {
+function sendPlayerCommand(command, options = {}) {
+  if (options.showWindow) showMainWindow();
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  mainWindow.webContents.send("player:command", command);
+  const send = () => mainWindow?.webContents.send("player:command", command);
+  if (mainWindow.webContents.isLoading()) {
+    mainWindow.webContents.once("did-finish-load", send);
+  } else {
+    send();
+  }
+}
+
+function applyDesktopLyricLock(locked, notify = false) {
+  desktopLyricLockedState = Boolean(locked);
+  if (!desktopLyricWindow || desktopLyricWindow.isDestroyed()) return;
+  if (notify) {
+    desktopLyricWindow.webContents.send("desktop-lyrics:data", { locked: desktopLyricLockedState });
+  }
 }
 
 function updateTrayMenu() {
@@ -581,14 +750,16 @@ function createDesktopLyricWindow() {
   <meta charset="utf-8" />
   <style>
     @property --word-progress { syntax: "<percentage>"; inherits: true; initial-value: 0%; }
-    html, body { margin: 0; width: 100%; height: 100%; background: transparent !important; overflow: hidden; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+    html, body { margin: 0; width: 100%; height: 100%; background: transparent !important; overflow: hidden; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; user-select: none; -webkit-user-select: none; }
     #app { height: 100%; display: flex; align-items: center; padding: 10px; box-sizing: border-box; background: transparent !important; }
-    .panel { -webkit-app-region: no-drag; position: relative; isolation: isolate; contain: paint; width: 100%; min-height: 88px; border: 1px solid rgba(255,255,255,.16); border-radius: 18px; background: rgba(8,10,18,.58); background-clip: padding-box; box-shadow: inset 0 1px 0 rgba(255,255,255,.14), inset 0 -1px 0 rgba(0,0,0,.18); backdrop-filter: blur(18px); padding: 12px 14px; color: white; box-sizing: border-box; overflow: hidden; transition: background .18s ease, border-color .18s ease, box-shadow .18s ease, backdrop-filter .18s ease; }
+    .panel { -webkit-app-region: drag; position: relative; isolation: isolate; contain: paint; width: 100%; min-height: 88px; border: 1px solid rgba(255,255,255,.16); border-radius: 18px; background: rgba(8,10,18,.58); background-clip: padding-box; box-shadow: inset 0 1px 0 rgba(255,255,255,.14), inset 0 -1px 0 rgba(0,0,0,.18); backdrop-filter: blur(18px); padding: 12px 14px; color: white; box-sizing: border-box; overflow: hidden; user-select: none; -webkit-user-select: none; transition: background .18s ease, border-color .18s ease, box-shadow .18s ease, backdrop-filter .18s ease; }
     .panel.idle { background: rgba(8,10,18,.01); border-color: transparent; box-shadow: none; backdrop-filter: none; }
     .panel.idle .top { opacity: 0; pointer-events: none; }
-    .locked { -webkit-app-region: no-drag; }
+    .panel.idle.controls-active .top { opacity: 1; pointer-events: auto; }
+    .locked { background: transparent; border-color: transparent; box-shadow: none; backdrop-filter: none; }
+    .locked, .locked .top, .locked .lyric, .locked .translation { -webkit-app-region: no-drag; }
     .locked.idle { background: transparent; border-color: transparent; box-shadow: none; backdrop-filter: none; }
-    .top { -webkit-app-region: drag; display: flex; align-items: center; justify-content: space-between; gap: 12px; transition: opacity .16s ease; }
+    .top { -webkit-app-region: drag; position: relative; display: flex; align-items: center; justify-content: space-between; gap: 12px; transition: opacity .16s ease; }
     .meta { display: flex; align-items: center; min-width: 0; gap: 10px; }
     .cover-box { width: 40px; height: 40px; border-radius: 8px; background: rgba(255,255,255,.1); color: rgba(255,255,255,.66); display: grid; place-items: center; overflow: hidden; flex: 0 0 auto; }
     .cover-box img { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -597,16 +768,22 @@ function createDesktopLyricWindow() {
     .cover-box.empty svg { display: block; }
     .title { font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .artist { margin-top: 2px; font-size: 11px; color: rgba(255,255,255,.66); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .controls { -webkit-app-region: no-drag; display: flex; gap: 6px; }
-    button { width: 28px; height: 28px; border-radius: 999px; border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.08); color: white; cursor: pointer; font-size: 15px; font-weight: 800; line-height: 1; padding: 0; }
+    .playback-controls { -webkit-app-region: no-drag; position: absolute; left: 50%; top: 50%; display: flex; align-items: center; gap: 8px; transform: translate(-50%, -50%); }
+    .window-controls { -webkit-app-region: no-drag; display: flex; gap: 6px; margin-left: auto; }
+    button { width: 28px; height: 28px; display: inline-grid; place-items: center; border-radius: 999px; border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.08); color: white; cursor: pointer; line-height: 1; padding: 0; }
+    button svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    .playback-controls button { width: 30px; height: 30px; background: rgba(255,255,255,.1); }
+    .playback-controls #play { width: 36px; height: 36px; background: rgba(255,255,255,.16); }
+    .playback-controls #play svg { width: 18px; height: 18px; }
     button:hover { border-color: rgba(255,255,255,.42); }
     button:focus { outline: none; }
     button:focus-visible { outline: 2px solid rgba(255,255,255,.45); outline-offset: 2px; }
-    .lyric { -webkit-app-region: no-drag; position: relative; margin-top: 8px; min-height: calc(var(--font-size, 30px) * 1.34); padding: 3px 0 5px; overflow: hidden; box-sizing: content-box; }
-    .translation { -webkit-app-region: no-drag; position: relative; margin-top: 0; min-height: calc(var(--second-line-size, 24px) * 1.34); padding: 2px 0 5px; overflow: hidden; box-sizing: content-box; }
-    .desktop-line { display: block; width: 100%; text-align: center; font-size: var(--font-size, 30px); line-height: 1.22; font-weight: var(--font-weight, 700); color: var(--played-color, #00b7c3); -webkit-text-stroke: 1px var(--stroke-color, rgba(0,0,0,.69)); paint-order: stroke fill; text-shadow: 1px 0 0 var(--stroke-color, rgba(0,0,0,.69)), -1px 0 0 var(--stroke-color, rgba(0,0,0,.69)), 0 1px 0 var(--stroke-color, rgba(0,0,0,.69)), 0 -1px 0 var(--stroke-color, rgba(0,0,0,.69)), 1px 1px 0 var(--stroke-color, rgba(0,0,0,.69)), -1px 1px 0 var(--stroke-color, rgba(0,0,0,.69)), 1px -1px 0 var(--stroke-color, rgba(0,0,0,.69)), -1px -1px 0 var(--stroke-color, rgba(0,0,0,.69)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: color .16s ease, text-shadow .16s ease, -webkit-text-stroke-color .16s ease, --word-progress .06s linear; will-change: opacity, transform; transform: translate3d(0,0,0); backface-visibility: hidden; -webkit-font-smoothing: antialiased; text-rendering: geometricPrecision; }
+    .lyric { -webkit-app-region: drag; position: relative; margin-top: 10px; min-height: calc(var(--font-size, 30px) * 1.48); padding: 5px 0 8px; overflow: hidden; box-sizing: content-box; }
+    .translation { -webkit-app-region: drag; position: relative; margin-top: 3px; min-height: calc(var(--second-line-size, 24px) * 1.42); padding: 3px 0 7px; overflow: hidden; box-sizing: content-box; }
+    .desktop-line { display: block; width: 100%; text-align: center; font-size: var(--font-size, 30px); line-height: 1.24; font-weight: var(--font-weight, 700); color: var(--played-color, #00b7c3); -webkit-text-stroke: 1px var(--stroke-color, rgba(0,0,0,.69)); paint-order: stroke fill; text-shadow: 1px 0 0 var(--stroke-color, rgba(0,0,0,.69)), -1px 0 0 var(--stroke-color, rgba(0,0,0,.69)), 0 1px 0 var(--stroke-color, rgba(0,0,0,.69)), 0 -1px 0 var(--stroke-color, rgba(0,0,0,.69)), 1px 1px 0 var(--stroke-color, rgba(0,0,0,.69)), -1px 1px 0 var(--stroke-color, rgba(0,0,0,.69)), 1px -1px 0 var(--stroke-color, rgba(0,0,0,.69)), -1px -1px 0 var(--stroke-color, rgba(0,0,0,.69)); white-space: nowrap; overflow: visible; text-overflow: clip; transition: color .16s ease, text-shadow .16s ease, -webkit-text-stroke-color .16s ease, --word-progress .06s linear; will-change: opacity, transform; transform: translate3d(0,0,0); backface-visibility: hidden; -webkit-font-smoothing: antialiased; text-rendering: geometricPrecision; }
     .desktop-line.current { position: relative; }
     .desktop-line.ghost { position: absolute; left: 0; right: 0; top: 0; height: auto; opacity: 0; transform: translate3d(0,28px,0); pointer-events: none; }
+    .measure-line { position: absolute; left: -99999px; top: -99999px; width: auto; min-width: 0; visibility: hidden; pointer-events: none; }
     .lyric > .desktop-line.ghost { top: 3px; }
     .translation > .desktop-line.ghost { top: 2px; }
     .desktop-line.no-transition { transition: none !important; }
@@ -639,12 +816,15 @@ function createDesktopLyricWindow() {
             <div id="artist" class="artist"></div>
           </div>
         </div>
-        <div class="controls">
-          <button title="Previous" onclick="window.electronAPI.desktopLyrics.sendCommand('previous')">&#x23EE;</button>
-          <button id="play" title="Play / pause" onclick="window.electronAPI.desktopLyrics.sendCommand('play-pause')">&#x25B6;</button>
-          <button title="Next" onclick="window.electronAPI.desktopLyrics.sendCommand('next')">&#x23ED;</button>
-          <button id="lock" title="Lock / unlock" onclick="window.electronAPI.desktopLyrics.sendCommand('lock-toggle')">&#x1F513;</button>
-          <button title="Close" onclick="window.electronAPI.desktopLyrics.sendCommand('close')">&#x00D7;</button>
+        <div class="playback-controls">
+          <button title="Previous" onclick="window.electronAPI.desktopLyrics.sendCommand('previous')"><svg viewBox="0 0 24 24"><path d="M19 20 9 12l10-8v16z"></path><path d="M5 19V5"></path></svg></button>
+          <button id="play" title="Play / pause" onclick="window.electronAPI.desktopLyrics.sendCommand('play-pause')"><svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5z"></path></svg></button>
+          <button title="Next" onclick="window.electronAPI.desktopLyrics.sendCommand('next')"><svg viewBox="0 0 24 24"><path d="m5 4 10 8-10 8V4z"></path><path d="M19 5v14"></path></svg></button>
+        </div>
+        <div class="window-controls">
+          <button id="lock" title="Lock / unlock" onclick="window.electronAPI.desktopLyrics.sendCommand('lock-toggle')"><svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V8a4 4 0 0 1 7.4-2.1"></path></svg></button>
+          <button title="Desktop lyric settings" onclick="window.electronAPI.desktopLyrics.sendCommand('desktop-settings')"><svg viewBox="0 0 24 24"><path d="M12 15.5A3.5 3.5 0 1 0 12 8a3.5 3.5 0 0 0 0 7.5z"></path><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.2a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.2a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1A2 2 0 1 1 7.1 4.3l.1.1a1.7 1.7 0 0 0 1.8.3 1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.2a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8 1.7 1.7 0 0 0 1.5 1h.2a2 2 0 1 1 0 4h-.2a1.7 1.7 0 0 0-1.4 1z"></path></svg></button>
+          <button title="Close" onclick="window.electronAPI.desktopLyrics.sendCommand('close')"><svg viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg></button>
         </div>
       </div>
       <div id="lyric" class="lyric">
@@ -656,6 +836,7 @@ function createDesktopLyricWindow() {
         <span id="translationGhost" class="desktop-line ghost"></span>
       </div>
       <span id="promotedLine" class="desktop-line promotion-line"></span>
+      <span id="lineMeasure" class="desktop-line measure-line"></span>
     </div>
   </div>
   <script>
@@ -664,24 +845,43 @@ function createDesktopLyricWindow() {
     const translation = document.getElementById('translation');
     let idleTimer = 0;
     let pointerInside = false;
+    let pointerOnControls = false;
     const setIdle = (idle) => panel.classList.toggle('idle', idle);
+    const setControlsActive = (active) => panel.classList.toggle('controls-active', active);
+    const queueIdle = (delay = 1050) => {
+      window.clearTimeout(idleTimer);
+      idleTimer = window.setTimeout(() => {
+        if (!pointerOnControls) setIdle(true);
+      }, delay);
+    };
     const showPanel = () => {
       pointerInside = true;
       window.clearTimeout(idleTimer);
       setIdle(false);
+      if (!pointerOnControls) queueIdle();
     };
     const scheduleIdle = () => {
       pointerInside = false;
-      window.clearTimeout(idleTimer);
-      idleTimer = window.setTimeout(() => {
-        if (!pointerInside) setIdle(true);
-      }, 650);
+      queueIdle(650);
     };
     appRoot.addEventListener('pointerenter', showPanel);
     appRoot.addEventListener('pointerover', showPanel);
     appRoot.addEventListener('mousemove', showPanel);
     appRoot.addEventListener('pointerleave', scheduleIdle);
     document.addEventListener('mousemove', showPanel);
+    document.querySelectorAll('.playback-controls, .window-controls').forEach((node) => {
+      node.addEventListener('pointerenter', () => {
+        pointerOnControls = true;
+        setControlsActive(true);
+        showPanel();
+      });
+      node.addEventListener('pointerleave', () => {
+        pointerOnControls = false;
+        setControlsActive(false);
+        scheduleIdle();
+      });
+      node.addEventListener('pointerdown', showPanel);
+    });
     scheduleIdle();
 
     const lyric = document.getElementById('lyric');
@@ -690,18 +890,69 @@ function createDesktopLyricWindow() {
     const translationCurrent = document.getElementById('translationCurrent');
     const translationGhost = document.getElementById('translationGhost');
     const promotedLine = document.getElementById('promotedLine');
+    const lineMeasure = document.getElementById('lineMeasure');
     const animationTimers = new WeakMap();
     const animationTokens = new WeakMap();
     const pendingTexts = new WeakMap();
+    const marqueeAnimations = new WeakMap();
+    const marqueeFrames = new WeakMap();
     let pairPending = null;
     let lastPrimaryText = '';
     let lastSecondText = '';
+    const clearMarquee = (node) => {
+      const frame = marqueeFrames.get(node);
+      if (frame) window.cancelAnimationFrame(frame);
+      marqueeFrames.delete(node);
+      const animation = marqueeAnimations.get(node);
+      if (animation) animation.cancel();
+      marqueeAnimations.delete(node);
+      delete node.dataset.marquee;
+      node.style.transform = '';
+    };
+    const updateMarquee = (node, delay = 720) => {
+      if (!node || node.classList.contains('ghost') || node === promotedLine) return;
+      clearMarquee(node);
+      const frame = window.requestAnimationFrame(() => {
+        marqueeFrames.delete(node);
+        if (!node.textContent || node.style.opacity === '0') return;
+        const style = getComputedStyle(node);
+        lineMeasure.textContent = node.textContent;
+        lineMeasure.style.fontFamily = style.fontFamily;
+        lineMeasure.style.fontSize = style.fontSize;
+        lineMeasure.style.fontWeight = style.fontWeight;
+        lineMeasure.style.letterSpacing = style.letterSpacing;
+        lineMeasure.style.lineHeight = style.lineHeight;
+        const textWidth = lineMeasure.getBoundingClientRect().width + 12;
+        const overflow = textWidth - node.clientWidth;
+        if (overflow <= 8) return;
+        node.dataset.marquee = 'true';
+        node.classList.remove('word');
+        node.style.removeProperty('--word-progress');
+        const distance = Math.ceil(overflow / 2) + 18;
+        const duration = Math.max(7200, Math.min(22000, (overflow + node.clientWidth) * 30));
+        const animation = node.animate([
+          { transform: 'translate3d(' + distance + 'px,0,0)', offset: 0 },
+          { transform: 'translate3d(' + distance + 'px,0,0)', offset: 0.12 },
+          { transform: 'translate3d(-' + distance + 'px,0,0)', offset: 0.88 },
+          { transform: 'translate3d(-' + distance + 'px,0,0)', offset: 1 }
+        ], {
+          delay,
+          duration,
+          iterations: Infinity,
+          easing: 'linear'
+        });
+        marqueeAnimations.set(node, animation);
+      });
+      marqueeFrames.set(node, frame);
+    };
     const setLineText = (node, value) => {
       const text = value || '';
       node.textContent = text;
       node.dataset.text = text;
     };
     const clearAnimation = (current, ghost) => {
+      clearMarquee(current);
+      clearMarquee(ghost);
       const timers = animationTimers.get(current);
       if (timers?.settleTimer) window.clearTimeout(timers.settleTimer);
       if (timers?.outAnimation) timers.outAnimation.cancel();
@@ -733,10 +984,15 @@ function createDesktopLyricWindow() {
     const setText = (current, ghost, value, animated) => {
       const next = value || '';
       if (pendingTexts.get(current) === next) return;
-      if (!animated || current.textContent === next) {
+      if (current.textContent === next && !pendingTexts.has(current)) {
+        if (!marqueeAnimations.has(current) && !marqueeFrames.has(current)) updateMarquee(current);
+        return;
+      }
+      if (!animated) {
         clearAnimation(current, ghost);
         pendingTexts.delete(current);
         setLineText(current, next);
+        updateMarquee(current);
         return;
       }
       clearAnimation(current, ghost);
@@ -768,9 +1024,13 @@ function createDesktopLyricWindow() {
       ], timing);
       const settle = () => {
         if (animationTokens.get(current) !== token) return;
+        setLineText(current, next);
+        current.style.opacity = '1';
+        current.style.transform = 'translate3d(0,0,0)';
+        ghost.style.opacity = '0';
+        ghost.style.transform = 'translate3d(0,0,0)';
         outAnimation.cancel();
         inAnimation.cancel();
-        setLineText(current, next);
         current.style.opacity = '';
         current.style.transform = '';
         current.style.lineHeight = '';
@@ -789,6 +1049,7 @@ function createDesktopLyricWindow() {
         pendingTexts.delete(current);
         animationTimers.delete(current);
         animationTokens.delete(current);
+        updateMarquee(current);
       };
       const settleTimer = window.setTimeout(settle, duration + 60);
       Promise.allSettled([outAnimation.finished, inAnimation.finished]).then(settle);
@@ -799,6 +1060,7 @@ function createDesktopLyricWindow() {
       if (pairPending.settleTimer) window.clearTimeout(pairPending.settleTimer);
       pairPending.animations.forEach((animation) => animation.cancel());
       [lyricCurrent, translationCurrent, translationGhost].forEach((node) => {
+        clearMarquee(node);
         node.style.opacity = '';
         node.style.transform = '';
         node.style.transformOrigin = '';
@@ -810,6 +1072,7 @@ function createDesktopLyricWindow() {
         node.style.removeProperty('--word-progress');
       });
       setLineText(promotedLine, '');
+      clearMarquee(promotedLine);
       promotedLine.classList.remove('word');
       promotedLine.style.cssText = '';
       translationCurrent.classList.remove('word');
@@ -836,7 +1099,7 @@ function createDesktopLyricWindow() {
         pairPending.wordProgress = wordProgress;
         return;
       }
-      const canPromoteSecond = animated && queueOriginals && lastSecondText && lastSecondText === nextPrimary && nextPrimary !== lastPrimaryText;
+      const canPromoteSecond = false;
       if (!canPromoteSecond) {
         clearPairAnimation();
         setText(lyricCurrent, lyricGhost, nextPrimary, animated);
@@ -937,12 +1200,18 @@ function createDesktopLyricWindow() {
       const settle = () => {
         if (pairPending?.primary !== nextPrimary) return;
         const finalSecond = pairPending.second;
-        oldMain.cancel();
-        promoted.cancel();
-        incomingSecond.cancel();
         setLineText(lyricCurrent, nextPrimary);
         setLineText(translationCurrent, finalSecond);
         setLineText(translationGhost, '');
+        lyricCurrent.style.opacity = '1';
+        lyricCurrent.style.transform = 'translate3d(0,0,0)';
+        translationCurrent.style.opacity = '1';
+        translationCurrent.style.transform = 'translate3d(0,0,0)';
+        translationGhost.style.opacity = '0';
+        translationGhost.style.transform = 'translate3d(0,0,0)';
+        oldMain.cancel();
+        promoted.cancel();
+        incomingSecond.cancel();
         [lyricCurrent, translationCurrent, translationGhost].forEach((node) => {
           node.style.opacity = '';
           node.style.transform = '';
@@ -966,14 +1235,28 @@ function createDesktopLyricWindow() {
         pairPending = null;
         lastPrimaryText = nextPrimary;
         lastSecondText = finalSecond;
+        updateMarquee(lyricCurrent);
+        updateMarquee(translationCurrent);
       };
       const settleTimer = window.setTimeout(settle, duration + 70);
       pairPending = { primary: nextPrimary, second: nextSecond, animations: [oldMain, promoted, incomingSecond], settleTimer, oldMainHadWord, wordByWord, wordProgress };
       Promise.allSettled([oldMain.finished, promoted.finished, incomingSecond.finished]).then(settle);
     };
+    const desktopIcons = {
+      play: '<svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5z"></path></svg>',
+      pause: '<svg viewBox="0 0 24 24"><path d="M8 5v14"></path><path d="M16 5v14"></path></svg>',
+      locked: '<svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V7a4 4 0 0 1 8 0v4"></path></svg>',
+      unlocked: '<svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"></rect><path d="M8 11V8a4 4 0 0 1 7.4-2.1"></path></svg>'
+    };
 
     window.electronAPI.desktopLyrics.onData((data) => {
-      panel.classList.toggle('locked', Boolean(data.locked));
+      data = data || {};
+      if (Object.prototype.hasOwnProperty.call(data, 'locked')) {
+        panel.classList.toggle('locked', Boolean(data.locked));
+        document.getElementById('lock').innerHTML = data.locked ? desktopIcons.locked : desktopIcons.unlocked;
+      }
+      const lockOnlyUpdate = Object.keys(data || {}).every((key) => key === 'locked');
+      if (lockOnlyUpdate) return;
       const hasCover = Boolean(data.cover);
       document.getElementById('coverBox').classList.toggle('empty', !hasCover);
       document.getElementById('cover').src = hasCover ? data.cover : '';
@@ -986,27 +1269,32 @@ function createDesktopLyricWindow() {
       panel.style.setProperty('--pending-color', data.pendingColor || '#ccc');
       panel.style.setProperty('--stroke-color', data.strokeColor || 'rgba(0,0,0,.69)');
       const desktopWordProgress = Math.max(0, Math.min(100, Number(data.wordProgress || 0))) + '%';
+      const lyricMarqueeing = lyricCurrent.dataset.marquee === 'true';
+      const shouldUseWordByWord = Boolean(data.wordByWord) && !lyricMarqueeing;
       if (!pairPending) {
-        lyricCurrent.classList.toggle('word', Boolean(data.wordByWord));
-        lyricGhost.classList.toggle('word', Boolean(data.wordByWord));
+        lyricCurrent.classList.toggle('word', shouldUseWordByWord);
+        lyricGhost.classList.toggle('word', shouldUseWordByWord);
       }
-      lyric.style.setProperty('--word-progress', desktopWordProgress);
+      if (shouldUseWordByWord) lyric.style.setProperty('--word-progress', desktopWordProgress);
+      else lyric.style.removeProperty('--word-progress');
       const wantsTranslation = Boolean(data.showTranslation && data.translation);
       const secondLine = data.doubleLine ? (wantsTranslation ? data.translation : (data.nextLyric || '')) : '';
       setDesktopLines(data.lyric || '...', secondLine, {
         animated: Boolean(data.switchAnimation),
         queueOriginals: Boolean(data.doubleLine && !wantsTranslation),
-        wordByWord: Boolean(data.wordByWord),
+        wordByWord: shouldUseWordByWord,
         wordProgress: data.wordProgress
       });
       translation.classList.toggle('empty', !secondLine);
-      document.getElementById('play').innerHTML = data.isPlaying ? '&#x23F8;' : '&#x25B6;';
-      document.getElementById('lock').innerHTML = data.locked ? '&#x1F512;' : '&#x1F513;';
+      document.getElementById('play').innerHTML = data.isPlaying ? desktopIcons.pause : desktopIcons.play;
     });
   </script>
 </body>
 </html>
 `)}`);
+  desktopLyricWindow.webContents.once("did-finish-load", () => {
+    applyDesktopLyricLock(desktopLyricLockedState, true);
+  });
   desktopLyricWindow.on("closed", () => {
     desktopLyricWindow = null;
     sendPlayerCommand("desktop-closed");
@@ -1046,6 +1334,8 @@ ipcMain.handle("library:read-metadata", async (_, filePath) => {
   return parseMetadataFromPath(filePath);
 });
 
+ipcMain.handle("library:resolve-cover", async (_, source, audioPath) => resolveCurrentCover(source, audioPath));
+
 ipcMain.handle("library:load-state", async () => readPersistedState());
 ipcMain.handle("library:save-state", async (_, state) => writePersistedState(state));
 
@@ -1075,20 +1365,26 @@ ipcMain.handle("desktop-lyrics:set-open", (_, open) => {
   }
 });
 
-ipcMain.handle("desktop-lyrics:update", (_, payload) => {
+ipcMain.handle("desktop-lyrics:update", async (_, payload) => {
   if (!desktopLyricWindow || desktopLyricWindow.isDestroyed()) return;
   if (!desktopLyricWindow.isVisible()) desktopLyricWindow.showInactive();
   desktopLyricWindow.setAlwaysOnTop(true, "screen-saver");
-  desktopLyricWindow.webContents.send("desktop-lyrics:data", payload || {});
+  const nextPayload = { ...(payload || {}) };
+  nextPayload.locked = desktopLyricLockedState;
+  if (nextPayload.cover) nextPayload.cover = await imageSourceToDataUrl(nextPayload.cover, 256);
+  desktopLyricWindow.webContents.send("desktop-lyrics:data", nextPayload);
 });
 
 ipcMain.handle("desktop-lyrics:set-locked", (_, locked) => {
-  if (!desktopLyricWindow || desktopLyricWindow.isDestroyed()) return;
-  return Boolean(locked);
+  applyDesktopLyricLock(locked, true);
+  return desktopLyricLockedState;
 });
 
 ipcMain.on("desktop-lyrics:command", (_, command) => {
-  sendPlayerCommand(command);
+  if (command === "lock-toggle") {
+    applyDesktopLyricLock(!desktopLyricLockedState, true);
+  }
+  sendPlayerCommand(command, { showWindow: command === "desktop-settings" });
 });
 
 ipcMain.handle("player:update", (_, state) => {

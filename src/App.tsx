@@ -5,7 +5,7 @@ import "@material/web/checkbox/checkbox.js";
 import stillLogoBlack from "../logo/Still_logo_black/Still_logo_black.ico";
 import stillLogoWhite from "../logo/Still_logo_white/Still_logo_white.ico";
 import { parseBlob, parseBuffer } from "music-metadata-browser";
-import { PointerEvent as ReactPointerEvent, ReactNode, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { PointerEvent as ReactPointerEvent, ReactNode, type RefObject, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 type View =
   | "songs"
@@ -176,6 +176,7 @@ type HostWindow = Window & {
       importFolder?: () => Promise<{ canceled?: boolean; tracks?: ImportedTrackResult[] }>;
       importPaths?: (paths: string[]) => Promise<{ canceled?: boolean; tracks?: ImportedTrackResult[] }>;
       getPathForFile?: (file: File) => string;
+      resolveCover?: (source: string, audioPath?: string) => Promise<string>;
       loadState?: () => Promise<PersistedAppState | null>;
       saveState?: (state: PersistedAppState) => Promise<boolean>;
     };
@@ -203,6 +204,11 @@ type IconButtonProps = {
 
 const AUDIO_TYPES = [".mp3", ".flac", ".wav", ".ogg", ".m4a", ".aac"];
 const TEXT_TYPES = [".lrc", ".tlrc", ".txt"];
+const TRACK_ROW_HEIGHT = 76;
+const TRACK_ALPHA_HEIGHT = 46;
+const TRACK_LIST_OVERSCAN = 8;
+const TRACK_LIST_VIRTUALIZE_THRESHOLD = 1800;
+const PLAYER_FOOTER_HEIGHT = 94;
 const TRACK_ALPHA_LETTERS = ["#", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"];
 const PINYIN_BOUNDARIES = [
   ["A", "阿"], ["B", "芭"], ["C", "嚓"], ["D", "搭"], ["E", "婀"], ["F", "发"], ["G", "旮"], ["H", "哈"],
@@ -210,6 +216,7 @@ const PINYIN_BOUNDARIES = [
   ["R", "然"], ["S", "撒"], ["T", "塌"], ["W", "挖"], ["X", "昔"], ["Y", "压"], ["Z", "匝"]
 ] as const;
 const PINYIN_CHAR_MAP: Record<string, string> = {
+  "\u90d1": "zheng", "\u7956": "zu",
   阿: "a", 艾: "ai", 安: "an", 暗: "an", 八: "ba", 爸: "ba", 白: "bai", 百: "bai", 半: "ban", 北: "bei", 不: "bu",
   擦: "ca", 参: "can", 曾: "ceng", 茶: "cha", 长: "chang", 超: "chao", 陈: "chen", 辰: "chen", 成: "cheng", 吃: "chi", 冲: "chong", 出: "chu", 春: "chun", 错: "cuo",
   大: "da", 丹: "dan", 当: "dang", 德: "de", 的: "de", 灯: "deng", 地: "di", 点: "dian", 东: "dong", 都: "dou",
@@ -236,6 +243,92 @@ const PINYIN_CHAR_MAP: Record<string, string> = {
 const zhCollator = new Intl.Collator("zh-Hans-u-co-pinyin", { numeric: true, sensitivity: "base" });
 const compareText = (a: string, b: string) => zhCollator.compare(a || "", b || "");
 const enCollator = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
+
+type VirtualTrackItem =
+  | { type: "alpha"; key: string; letter: string }
+  | { type: "track"; key: string; track: Track; index: number };
+
+type VirtualTrackScrollDetail = {
+  pageKey: string;
+  letter?: string;
+  trackId?: string;
+};
+
+function hashString(value: string) {
+  let hash = 5381;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = ((hash << 5) + hash) ^ value.charCodeAt(index);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function makeLocalTrackId(localPath: string | undefined, relativePath: string) {
+  return `local-${hashString((localPath || relativePath || "").toLowerCase())}`;
+}
+
+function normalizeTrackPathKey(filePath: string | undefined) {
+  return (filePath || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+function getParentPath(filePath: string) {
+  const normalized = filePath.replace(/\\/g, "/");
+  const index = normalized.lastIndexOf("/");
+  return index > 0 ? normalized.slice(0, index) : normalized;
+}
+
+function compactImportRoots(paths: string[]) {
+  const roots: string[] = [];
+  const seen = new Set<string>();
+  paths
+    .map((item) => item.replace(/\\/g, "/").replace(/\/+$/, ""))
+    .filter(Boolean)
+    .sort((a, b) => a.length - b.length)
+    .forEach((item) => {
+      const key = item.toLowerCase();
+      if (seen.has(key)) return;
+      if (roots.some((root) => key.startsWith(`${root.toLowerCase()}/`))) return;
+      seen.add(key);
+      roots.push(item);
+    });
+  return roots;
+}
+
+function mergeTracksById(existing: Track[], incoming: Track[]) {
+  const merged = new Map<string, Track>();
+  const pathToId = new Map<string, string>();
+  existing.forEach((track) => {
+    const pathKey = normalizeTrackPathKey(track.localPath || track.filePath);
+    if (pathKey && pathToId.has(pathKey)) return;
+    merged.set(track.id, track);
+    if (pathKey) pathToId.set(pathKey, track.id);
+  });
+  incoming.forEach((track) => {
+    const pathKey = normalizeTrackPathKey(track.localPath || track.filePath);
+    const existingId = pathKey ? pathToId.get(pathKey) : undefined;
+    const id = existingId || track.id;
+    merged.set(id, { ...track, id });
+    if (pathKey) pathToId.set(pathKey, id);
+  });
+  return [...merged.values()];
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  mapper: (item: T, index: number) => Promise<R>
+) {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex += 1;
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 
 const PAGE_ANIMATION = {
   initial: { opacity: 0, y: 10 },
@@ -271,6 +364,184 @@ function LineIcon({ children, className = "h-5 w-5" }: { children: ReactNode; cl
     >
       {children}
     </svg>
+  );
+}
+
+function VirtualizedTrackRows({
+  pageKey,
+  items,
+  scrollParentRef,
+  emptyText,
+  renderItem
+}: {
+  pageKey: string;
+  items: VirtualTrackItem[];
+  scrollParentRef: RefObject<HTMLElement | null>;
+  emptyText: string;
+  renderItem: (item: VirtualTrackItem) => ReactNode;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const rafRef = useRef<number | null>(null);
+  const [viewport, setViewport] = useState({ top: 0, height: 720 });
+
+  const { offsets, totalHeight, letterIndex, trackIndex } = useMemo(() => {
+    const nextOffsets: number[] = [];
+    const nextLetterIndex = new Map<string, number>();
+    const nextTrackIndex = new Map<string, number>();
+    let top = 0;
+    items.forEach((item, index) => {
+      nextOffsets[index] = top;
+      if (item.type === "alpha") nextLetterIndex.set(item.letter, index);
+      if (item.type === "track") nextTrackIndex.set(item.track.id, index);
+      top += item.type === "alpha" ? TRACK_ALPHA_HEIGHT : TRACK_ROW_HEIGHT;
+    });
+    return {
+      offsets: nextOffsets,
+      totalHeight: top,
+      letterIndex: nextLetterIndex,
+      trackIndex: nextTrackIndex
+    };
+  }, [items]);
+
+  const updateViewport = useCallback(() => {
+    const parent = scrollParentRef.current;
+    const container = containerRef.current;
+    if (!parent || !container) return;
+    const parentRect = parent.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    const top = Math.max(0, parentRect.top - containerRect.top);
+    setViewport({ top, height: parent.clientHeight || window.innerHeight });
+  }, [scrollParentRef]);
+
+  useLayoutEffect(() => {
+    updateViewport();
+    const parent = scrollParentRef.current;
+    if (!parent) return;
+    const requestUpdate = () => {
+      if (rafRef.current !== null) return;
+      rafRef.current = window.requestAnimationFrame(() => {
+        rafRef.current = null;
+        updateViewport();
+      });
+    };
+    const resizeObserver = new ResizeObserver(requestUpdate);
+    if (containerRef.current) resizeObserver.observe(containerRef.current);
+    resizeObserver.observe(parent);
+    parent.addEventListener("scroll", requestUpdate, { passive: true });
+    window.addEventListener("resize", requestUpdate);
+    return () => {
+      if (rafRef.current !== null) window.cancelAnimationFrame(rafRef.current);
+      resizeObserver.disconnect();
+      parent.removeEventListener("scroll", requestUpdate);
+      window.removeEventListener("resize", requestUpdate);
+    };
+  }, [scrollParentRef, updateViewport]);
+
+  useLayoutEffect(() => {
+    updateViewport();
+    const frame = window.requestAnimationFrame(updateViewport);
+    const timer = window.setTimeout(updateViewport, 80);
+    let retries = 0;
+    let retryTimer = 0;
+    const retryMeasure = () => {
+      retries += 1;
+      updateViewport();
+      if (retries < 12) retryTimer = window.setTimeout(retryMeasure, 90);
+    };
+    retryTimer = window.setTimeout(retryMeasure, 160);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearTimeout(timer);
+      window.clearTimeout(retryTimer);
+    };
+  }, [items.length, pageKey, totalHeight, updateViewport]);
+
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<VirtualTrackScrollDetail>).detail;
+      if (!detail || detail.pageKey !== pageKey) return;
+      const parent = scrollParentRef.current;
+      const container = containerRef.current;
+      if (!parent || !container) return;
+      const index = detail.letter
+        ? letterIndex.get(detail.letter)
+        : detail.trackId
+          ? trackIndex.get(detail.trackId)
+          : undefined;
+      if (index === undefined) return;
+      const parentRect = parent.getBoundingClientRect();
+      const containerRect = container.getBoundingClientRect();
+      const containerTopInScroll = parent.scrollTop + containerRect.top - parentRect.top;
+      parent.scrollTo({
+        top: containerTopInScroll + offsets[index] - 12,
+        behavior: "smooth"
+      });
+    };
+    window.addEventListener("still:virtual-track-scroll", handler);
+    return () => window.removeEventListener("still:virtual-track-scroll", handler);
+  }, [letterIndex, offsets, pageKey, scrollParentRef, trackIndex]);
+
+  const shouldVirtualize = items.length > TRACK_LIST_VIRTUALIZE_THRESHOLD;
+  const [startIndex, endIndex] = useMemo(() => {
+    if (!items.length) return [0, -1];
+    if (!shouldVirtualize) return [0, items.length - 1];
+    const startTop = Math.max(0, viewport.top - TRACK_ROW_HEIGHT * TRACK_LIST_OVERSCAN);
+    const endTop = viewport.top + viewport.height + TRACK_ROW_HEIGHT * TRACK_LIST_OVERSCAN;
+    let lo = 0;
+    let hi = offsets.length - 1;
+    let start = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1;
+      const itemHeight = items[mid].type === "alpha" ? TRACK_ALPHA_HEIGHT : TRACK_ROW_HEIGHT;
+      if (offsets[mid] + itemHeight >= startTop) {
+        start = mid;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    lo = start;
+    hi = offsets.length - 1;
+    let end = start;
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1;
+      if (offsets[mid] <= endTop) {
+        end = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    const expectedWindow = Math.min(
+      items.length,
+      Math.max(28, Math.ceil(Math.max(viewport.height, window.innerHeight * 0.5) / TRACK_ROW_HEIGHT) + TRACK_LIST_OVERSCAN * 2)
+    );
+    const safeEnd = Math.max(end, start + expectedWindow - 1);
+    return [start, Math.min(items.length - 1, safeEnd)];
+  }, [items, offsets, shouldVirtualize, viewport.height, viewport.top]);
+
+  if (!items.length) {
+    return <p className="rounded-xl border border-dashed border-[var(--line)] px-4 py-8 text-center text-sm text-[var(--dim)]">{emptyText}</p>;
+  }
+
+  return (
+    <div id={`track-virtual-list-${pageKey}`} ref={containerRef} className="relative" style={{ height: totalHeight }}>
+      {items.slice(startIndex, endIndex + 1).map((item, localIndex) => {
+        const index = startIndex + localIndex;
+        return (
+          <div
+            key={item.key}
+            className="absolute left-0 right-0"
+            style={{
+              height: item.type === "alpha" ? TRACK_ALPHA_HEIGHT : TRACK_ROW_HEIGHT,
+              transform: `translateY(${offsets[index]}px)`
+            }}
+          >
+            {renderItem(item)}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -913,6 +1184,7 @@ const SEARCH_PINYIN_BOUNDARIES = [
   ["r", "然"], ["s", "撒"], ["t", "塌"], ["w", "挖"], ["x", "昔"], ["y", "压"], ["z", "匝"]
 ] as const;
 const SEARCH_PINYIN_CHAR_MAP: Record<string, string> = {
+  "\u90d1": "zheng", "\u7956": "zu",
   阿: "a", 啊: "a", 爱: "ai", 安: "an", 暗: "an",
   八: "ba", 把: "ba", 白: "bai", 百: "bai", 半: "ban", 北: "bei", 悲: "bei", 别: "bie", 不: "bu",
   蔡: "cai", 曾: "ceng", 长: "chang", 唱: "chang", 超: "chao", 陈: "chen", 城: "cheng", 春: "chun",
@@ -1672,9 +1944,11 @@ export default function App() {
   const playbackFrameRef = useRef<number | null>(null);
   const currentLyricsRef = useRef<LyricLine[]>([]);
   const currentTrackDurationRef = useRef(0);
+  const desktopLyricPayloadKeyRef = useRef("");
   const trackAlphaBubbleTimerRef = useRef<number | null>(null);
   const mainPointerRef = useRef({ x: 0, y: 0 });
   const scrollbarDraggingRef = useRef(false);
+  const customScrollbarDraggingRef = useRef(false);
 
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [view, setView] = useState<View>("songs");
@@ -1761,6 +2035,7 @@ export default function App() {
   const [unreadableTrackIds, setUnreadableTrackIds] = useState<string[]>([]);
   const [missingPromptTrackId, setMissingPromptTrackId] = useState("");
   const [libraryDragActive, setLibraryDragActive] = useState(false);
+  const [libraryRefreshing, setLibraryRefreshing] = useState(false);
   const [settingsTab, setSettingsTab] = useState<"personal" | "lyrics" | "about">("personal");
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
@@ -1768,6 +2043,7 @@ export default function App() {
   const [accentColor, setAccentColor] = useState("#008B8B");
   const [accentMode, setAccentMode] = useState<AccentMode>("manual");
   const [coverAccentColor, setCoverAccentColor] = useState("");
+  const [resolvedCurrentCover, setResolvedCurrentCover] = useState("");
   const [coverAspectRatios, setCoverAspectRatios] = useState<Record<string, number>>({});
   const [viewportSize, setViewportSize] = useState(() => ({
     width: typeof window === "undefined" ? 1280 : window.innerWidth,
@@ -1775,6 +2051,8 @@ export default function App() {
   }));
   const [trackAlphaBubble, setTrackAlphaBubble] = useState({ visible: false, letter: "#", x: 0, y: 0 });
   const [trackAlphaPickerOpen, setTrackAlphaPickerOpen] = useState(false);
+  const [mainScrollbar, setMainScrollbar] = useState({ visible: false, top: 0, right: 0, height: 0, thumbTop: 0, thumbHeight: 28 });
+  const [customScrollbarDragging, setCustomScrollbarDragging] = useState(false);
 
   const folderInputAttrs: Record<string, string> = { webkitdirectory: "", directory: "" };
 
@@ -1804,7 +2082,10 @@ export default function App() {
     .filter((track) => track.localPath || track.audioUrl.startsWith("file://"))
     .map((track) => ({
       ...track,
-      audioUrl: track.localPath ? toFileUrl(track.localPath) : track.audioUrl
+      audioUrl: track.localPath ? toFileUrl(track.localPath) : track.audioUrl,
+      cover: track.localPath && /^(data|blob):/.test(track.cover)
+        ? makeCover(["#24459e", "#4b63cc"], "Local")
+        : track.cover
     }));
 
   const restoreState = (state: PersistedAppState | null) => {
@@ -2108,14 +2389,44 @@ export default function App() {
   }, [tracks]);
 
   useEffect(() => {
+    let active = true;
+    const cover = currentTrack?.cover || "";
+    const audioPath = currentTrack?.localPath || "";
+    if (!cover && !audioPath) {
+      setResolvedCurrentCover("");
+      return;
+    }
+    if (!audioPath && !cover.startsWith("file://")) {
+      setResolvedCurrentCover(cover);
+      return;
+    }
+    const host = window as HostWindow;
+    const resolveCover = host.electronAPI?.library?.resolveCover;
+    if (!resolveCover) {
+      setResolvedCurrentCover(cover);
+      return;
+    }
+    resolveCover(cover, audioPath)
+      .then((resolved) => {
+        if (active) setResolvedCurrentCover(resolved || cover || "");
+      })
+      .catch(() => {
+        if (active) setResolvedCurrentCover(cover || "");
+      });
+    return () => {
+      active = false;
+    };
+  }, [currentTrack?.cover, currentTrack?.localPath]);
+
+  useEffect(() => {
     if (!("mediaSession" in navigator) || typeof MediaMetadata === "undefined" || !currentTrack) return;
     try {
-      const artwork = currentTrack.cover
+      const artwork = resolvedCurrentCover
         ? [
-            { src: currentTrack.cover, sizes: "1024x1024", type: currentTrack.cover.startsWith("data:image/jpeg") ? "image/jpeg" : "image/png" },
-            { src: currentTrack.cover, sizes: "512x512", type: currentTrack.cover.startsWith("data:image/jpeg") ? "image/jpeg" : "image/png" },
-            { src: currentTrack.cover, sizes: "256x256", type: currentTrack.cover.startsWith("data:image/jpeg") ? "image/jpeg" : "image/png" },
-            { src: currentTrack.cover, sizes: "96x96", type: currentTrack.cover.startsWith("data:image/jpeg") ? "image/jpeg" : "image/png" }
+            { src: resolvedCurrentCover, sizes: "1024x1024", type: resolvedCurrentCover.startsWith("data:image/jpeg") ? "image/jpeg" : "image/png" },
+            { src: resolvedCurrentCover, sizes: "512x512", type: resolvedCurrentCover.startsWith("data:image/jpeg") ? "image/jpeg" : "image/png" },
+            { src: resolvedCurrentCover, sizes: "256x256", type: resolvedCurrentCover.startsWith("data:image/jpeg") ? "image/jpeg" : "image/png" },
+            { src: resolvedCurrentCover, sizes: "96x96", type: resolvedCurrentCover.startsWith("data:image/jpeg") ? "image/jpeg" : "image/png" }
           ]
         : undefined;
       navigator.mediaSession.metadata = new MediaMetadata({
@@ -2141,7 +2452,7 @@ export default function App() {
       audioRef.current.currentTime = event.seekTime;
       setCurrentTime(event.seekTime);
     });
-  }, [currentTrack?.id, currentTrack?.title, currentTrack?.artist, currentTrack?.album, currentTrack?.cover, isPlaying, currentQueueIndex, queueTracks]);
+  }, [currentTrack?.id, currentTrack?.title, currentTrack?.artist, currentTrack?.album, resolvedCurrentCover, isPlaying, currentQueueIndex, queueTracks]);
 
   useEffect(() => {
     const host = window as HostWindow;
@@ -2319,7 +2630,7 @@ export default function App() {
         title: currentTrack.title,
         artist: currentTrack.artist,
         album: currentTrack.album,
-        cover: currentTrack.cover,
+        cover: resolvedCurrentCover || currentTrack.cover,
         hasTrack: true
       }
     : {
@@ -2329,7 +2640,7 @@ export default function App() {
         cover: "",
         hasTrack: false
       },
-    [currentTrack]
+    [currentTrack, resolvedCurrentCover]
   );
   useEffect(() => {
     translationPreferenceRef.current = translationPreference;
@@ -2743,6 +3054,18 @@ export default function App() {
     setView(previous || "songs");
   };
 
+  const openDesktopLyricSettings = () => {
+    setLyricsOpen(false);
+    setSettingsTab("lyrics");
+    navigateTo("settings");
+    window.setTimeout(() => {
+      document.getElementById("desktop-lyric-settings")?.scrollIntoView({
+        behavior: "smooth",
+        block: "start"
+      });
+    }, 120);
+  };
+
   const canNavigateBack = view !== "songs" || viewHistoryRef.current.length > 0;
 
   useEffect(() => {
@@ -2813,10 +3136,55 @@ export default function App() {
     if (!currentTrack || currentTrackInCurrentPageIndex < 0) return;
     setLocatedTrackId(currentTrack.id);
     window.setTimeout(() => {
-      document.getElementById(`track-row-${currentTrack.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+      const target = document.getElementById(`track-row-${currentTrack.id}`);
+      if (target) {
+        target.scrollIntoView({ behavior: "smooth", block: "center" });
+      } else {
+        window.dispatchEvent(new CustomEvent<VirtualTrackScrollDetail>("still:virtual-track-scroll", {
+          detail: { pageKey: view, trackId: currentTrack.id }
+        }));
+      }
     }, 80);
     window.setTimeout(() => setLocatedTrackId(null), 1800);
   };
+
+  const updateMainScrollbar = useCallback(() => {
+    const main = mainScrollRef.current;
+    if (!main) {
+      setMainScrollbar((prev) => ({ ...prev, visible: false }));
+      return;
+    }
+    const rect = main.getBoundingClientRect();
+    const top = rect.top;
+    const bottom = Math.min(rect.bottom, window.innerHeight - PLAYER_FOOTER_HEIGHT);
+    const height = Math.max(0, bottom - top);
+    const maxScroll = Math.max(0, main.scrollHeight - main.clientHeight);
+    if (height <= 0 || maxScroll <= 1) {
+      setMainScrollbar((prev) => ({ ...prev, visible: false, top, height }));
+      return;
+    }
+    const thumbHeight = Math.max(28, Math.min(height, height * (main.clientHeight / Math.max(main.scrollHeight, 1))));
+    const travel = Math.max(1, height - thumbHeight);
+    const thumbTop = top + (main.scrollTop / maxScroll) * travel;
+    setMainScrollbar({
+      visible: true,
+      top,
+      right: Math.max(0, window.innerWidth - rect.right),
+      height,
+      thumbTop,
+      thumbHeight
+    });
+  }, []);
+
+  const scrollMainFromScrollbarY = useCallback((clientY: number) => {
+    const main = mainScrollRef.current;
+    if (!main || !mainScrollbar.visible) return;
+    const maxScroll = Math.max(0, main.scrollHeight - main.clientHeight);
+    const travel = Math.max(1, mainScrollbar.height - mainScrollbar.thumbHeight);
+    const nextRatio = Math.max(0, Math.min(1, (clientY - mainScrollbar.top - mainScrollbar.thumbHeight / 2) / travel));
+    main.scrollTop = nextRatio * maxScroll;
+    updateMainScrollbar();
+  }, [mainScrollbar, updateMainScrollbar]);
 
   const showTrackAlphaBubble = useCallback((letter: string) => {
     if (!availableAlphaLetters.length) return;
@@ -2825,12 +3193,16 @@ export default function App() {
     const pointer = mainPointerRef.current;
     const maxScroll = main ? Math.max(1, main.scrollHeight - main.clientHeight) : 1;
     const scrollRatio = main ? main.scrollTop / maxScroll : 0.5;
-    const scrollY = rect ? rect.top + scrollRatio * rect.height : window.innerHeight / 2;
+    const bubbleRadius = 28;
+    const minY = rect ? rect.top + bubbleRadius : 90;
+    const maxY = Math.max(minY, rect ? Math.min(rect.bottom, window.innerHeight - PLAYER_FOOTER_HEIGHT) - bubbleRadius : window.innerHeight - PLAYER_FOOTER_HEIGHT - bubbleRadius);
+    const scrollY = minY + scrollRatio * Math.max(1, maxY - minY);
+    const pointerY = Math.max(minY, Math.min(maxY, pointer.y || scrollY));
     setTrackAlphaBubble({
       visible: true,
       letter,
       x: rect ? rect.right - 58 : window.innerWidth - 70,
-      y: scrollbarDraggingRef.current ? scrollY : (pointer.y || scrollY)
+      y: scrollbarDraggingRef.current ? scrollY : pointerY
     });
     if (trackAlphaBubbleTimerRef.current) window.clearTimeout(trackAlphaBubbleTimerRef.current);
     trackAlphaBubbleTimerRef.current = window.setTimeout(() => {
@@ -2841,6 +3213,26 @@ export default function App() {
   const getCurrentTrackAlphaLetter = useCallback(() => {
     const main = mainScrollRef.current;
     if (!main) return availableAlphaLetters[0] || "#";
+    const virtualList = document.getElementById(`track-virtual-list-${view}`);
+    if (virtualList && currentAlphaTracks.length) {
+      const mainRect = main.getBoundingClientRect();
+      const listRect = virtualList.getBoundingClientRect();
+      const probeTop = Math.max(0, mainRect.top - listRect.top + 90);
+      let active = availableAlphaLetters[0] || "#";
+      let top = 0;
+      let previousLetter = "";
+      for (const track of currentAlphaTracks) {
+        const letter = getTrackAlphaLetter(track, sortKey);
+        if (letter !== previousLetter) {
+          if (top > probeTop) break;
+          active = letter;
+          previousLetter = letter;
+          top += TRACK_ALPHA_HEIGHT;
+        }
+        top += TRACK_ROW_HEIGHT;
+      }
+      return active;
+    }
     const mainRect = main.getBoundingClientRect();
     const headers = [...main.querySelectorAll<HTMLElement>("[data-alpha-letter]")];
     let active = headers[0]?.dataset.alphaLetter || availableAlphaLetters[0] || "#";
@@ -2852,12 +3244,13 @@ export default function App() {
       }
     }
     return active;
-  }, [availableAlphaLetters]);
+  }, [availableAlphaLetters, currentAlphaTracks, sortKey, view]);
 
   const handleMainScroll = useCallback(() => {
+    updateMainScrollbar();
     if (!availableAlphaLetters.length || !scrollbarDraggingRef.current) return;
     showTrackAlphaBubble(getCurrentTrackAlphaLetter());
-  }, [availableAlphaLetters.length, getCurrentTrackAlphaLetter, showTrackAlphaBubble]);
+  }, [availableAlphaLetters.length, getCurrentTrackAlphaLetter, showTrackAlphaBubble, updateMainScrollbar]);
 
   const handleMainPointerMove = useCallback((event: ReactPointerEvent<HTMLElement>) => {
     mainPointerRef.current = { x: event.clientX, y: event.clientY };
@@ -2877,12 +3270,46 @@ export default function App() {
 
   const endScrollbarDrag = useCallback(() => {
     scrollbarDraggingRef.current = false;
+    customScrollbarDraggingRef.current = false;
+    setCustomScrollbarDragging(false);
   }, []);
+
+  useLayoutEffect(() => {
+    updateMainScrollbar();
+    const frame = window.requestAnimationFrame(updateMainScrollbar);
+    window.addEventListener("resize", updateMainScrollbar);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.removeEventListener("resize", updateMainScrollbar);
+    };
+  }, [currentAlphaTracks.length, updateMainScrollbar, view]);
+
+  useEffect(() => {
+    if (!customScrollbarDragging) return;
+    const onPointerMove = (event: PointerEvent) => {
+      mainPointerRef.current = { x: event.clientX, y: event.clientY };
+      scrollMainFromScrollbarY(event.clientY);
+      if (availableAlphaLetters.length) showTrackAlphaBubble(getCurrentTrackAlphaLetter());
+    };
+    const onPointerUp = () => endScrollbarDrag();
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp, { once: true });
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+    };
+  }, [availableAlphaLetters.length, customScrollbarDragging, endScrollbarDrag, getCurrentTrackAlphaLetter, scrollMainFromScrollbarY, showTrackAlphaBubble, mainScrollbar]);
 
   const scrollToTrackAlphaLetter = useCallback((letter: string) => {
     setTrackAlphaPickerOpen(false);
     const target = document.getElementById(`track-alpha-${view}-${letter}`);
-    target?.scrollIntoView({ behavior: "smooth", block: "start" });
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+    } else {
+      window.dispatchEvent(new CustomEvent<VirtualTrackScrollDetail>("still:virtual-track-scroll", {
+        detail: { pageKey: view, letter }
+      }));
+    }
     showTrackAlphaBubble(letter);
   }, [showTrackAlphaBubble, view]);
 
@@ -3248,12 +3675,14 @@ export default function App() {
       if (command === "desktop-toggle") setDesktopLyricOpen((prev) => !prev);
       if (command === "desktop-closed") setDesktopLyricOpen(false);
       if (command === "lock-toggle") setDesktopLyricLocked((prev) => !prev);
+      if (command === "desktop-settings") openDesktopLyricSettings();
       if (command === "close") setDesktopLyricOpen(false);
     });
-  }, [queueTracks, currentQueueIndex, tracks, currentTrack]);
+  }, [queueTracks, currentQueueIndex, tracks, currentTrack, openDesktopLyricSettings]);
 
   useEffect(() => {
     const host = window as HostWindow;
+    if (desktopLyricOpen) desktopLyricPayloadKeyRef.current = "";
     void host.electronAPI?.desktopLyrics?.setOpen?.(desktopLyricOpen);
   }, [desktopLyricOpen]);
 
@@ -3268,19 +3697,45 @@ export default function App() {
     const nextLine = activeLyricIndex >= 0 ? currentLyrics[activeLyricIndex + 1] : undefined;
     const desktopWordByWord = desktopLyricWordByWord === "auto" && Boolean(activeLine?.words?.length);
     const desktopInfo = currentTrack || IDLE_TRACK_INFO;
+    const wordProgress = desktopWordByWord && activeLine ? getLyricWordProgress(activeLine, activeLyricIndex) * 100 : 0;
+    const cover = resolvedCurrentCover || currentTrack?.cover || "";
+    const payloadKey = [
+      currentTrack?.id || "idle",
+      desktopInfo.title,
+      desktopInfo.artist,
+      desktopInfo.album,
+      cover.length,
+      activeLine?.text || "",
+      activeLine?.translation || "",
+      nextLine?.text || "",
+      desktopLyricDoubleLine,
+      desktopLyricShowTranslation,
+      desktopWordByWord,
+      desktopWordByWord ? Math.round(wordProgress * 10) / 10 : 0,
+      desktopLyricSwitchAnimation,
+      desktopLyricFontSize,
+      desktopLyricSecondLineSize,
+      desktopLyricFontWeight,
+      desktopLyricPlayedColor,
+      desktopLyricPendingColor,
+      desktopLyricStrokeColor,
+      isPlaying,
+      desktopLyricLocked
+    ].join("\u001f");
+    if (desktopLyricPayloadKeyRef.current === payloadKey) return;
+    desktopLyricPayloadKeyRef.current = payloadKey;
     const host = window as HostWindow;
     void host.electronAPI?.desktopLyrics?.update?.({
       title: desktopInfo.title,
       artist: desktopInfo.artist,
       album: desktopInfo.album,
-      cover: currentTrack?.cover || "",
+      cover,
       lyric: currentTrack ? (activeLine?.text || "...") : IDLE_TRACK_INFO.title,
       translation: activeLine?.translation || "",
       nextLyric: nextLine?.text || "",
       doubleLine: desktopLyricDoubleLine,
       showTranslation: desktopLyricShowTranslation,
       wordByWord: desktopWordByWord,
-      wordProgress: desktopWordByWord && activeLine ? getLyricWordProgress(activeLine, activeLyricIndex) * 100 : 0,
       switchAnimation: desktopLyricSwitchAnimation,
       fontSize: desktopLyricFontSize,
       secondLineSize: desktopLyricSecondLineSize,
@@ -3289,13 +3744,22 @@ export default function App() {
       pendingColor: desktopLyricPendingColor,
       strokeColor: desktopLyricStrokeColor,
       isPlaying,
-      locked: desktopLyricLocked
+      locked: desktopLyricLocked,
+      wordProgress
     });
-  }, [desktopLyricOpen, desktopLyricLocked, desktopLyricDoubleLine, desktopLyricShowTranslation, desktopLyricWordByWord, desktopLyricSwitchAnimation, desktopLyricFontSize, desktopLyricSecondLineSize, desktopLyricFontWeight, desktopLyricPlayedColor, desktopLyricPendingColor, desktopLyricStrokeColor, currentTrack?.id, currentTrack?.title, currentTrack?.artist, currentTrack?.album, currentTrack?.cover, activeLyricIndex, currentLyrics, currentTime, translationEnabled, isPlaying]);
+  }, [desktopLyricOpen, desktopLyricLocked, desktopLyricDoubleLine, desktopLyricShowTranslation, desktopLyricWordByWord, desktopLyricSwitchAnimation, desktopLyricFontSize, desktopLyricSecondLineSize, desktopLyricFontWeight, desktopLyricPlayedColor, desktopLyricPendingColor, desktopLyricStrokeColor, currentTrack?.id, currentTrack?.title, currentTrack?.artist, currentTrack?.album, currentTrack?.cover, resolvedCurrentCover, activeLyricIndex, currentLyrics, currentTime, translationEnabled, isPlaying]);
 
-  const appendImportedTracks = (imported: ImportedTrackResult[]) => {
+  const appendImportedTracks = (
+    imported: ImportedTrackResult[],
+    options: { navigate?: boolean } = {}
+  ) => {
     if (!imported.length) return 0;
-    const now = Date.now();
+    const shouldNavigate = options.navigate ?? true;
+    const existingPathIds = new Map<string, string>();
+    tracks.forEach((track) => {
+      const pathKey = normalizeTrackPathKey(track.localPath || track.filePath);
+      if (pathKey && !existingPathIds.has(pathKey)) existingPathIds.set(pathKey, track.id);
+    });
     const loaded = imported.map((item, idx) => {
       const relative = (item.relativePath || "").split("\\").join("/");
       const fileName = relative.split("/").pop() || item.localPath.split("\\").pop() || `track-${idx + 1}`;
@@ -3316,7 +3780,7 @@ export default function App() {
       );
 
       return {
-        id: `local-${now}-${idx}`,
+        id: existingPathIds.get(normalizeTrackPathKey(item.localPath || relative)) || makeLocalTrackId(item.localPath, relative),
         title: item.title || guessedTitle,
         artist: normalizeArtistList(item.artist).join(" / ") || "Unknown Artist",
         album: item.album || "Unknown Album",
@@ -3345,9 +3809,9 @@ export default function App() {
       } as Track;
     });
 
-    setTracks((prev) => [...prev, ...loaded]);
+    setTracks((prev) => mergeTracksById(prev, loaded));
     setPlayQueueIds((prev) => [...prev, ...loaded.map((track) => track.id).filter((id) => !prev.includes(id))]);
-    navigateTo("songs");
+    if (shouldNavigate) navigateTo("songs");
     setCurrentTrackId((prev) => prev || loaded[0].id);
     return loaded.length;
   };
@@ -3398,12 +3862,15 @@ export default function App() {
         imageMap.set(key, url);
         imageMap.set(getBaseName(file.name).toLowerCase(), url);
         if (dir) imageMap.set(`${dir}/${getBaseName(file.name).toLowerCase()}`, url);
-      });
+    });
 
     const audioFiles = files.filter((file) => AUDIO_TYPES.includes(getExt(file.name)));
-    const now = Date.now();
-    const loaded = await Promise.all(
-      audioFiles.map(async (file, idx) => {
+    const existingPathIds = new Map<string, string>();
+    tracks.forEach((track) => {
+      const pathKey = normalizeTrackPathKey(track.localPath || track.filePath);
+      if (pathKey && !existingPathIds.has(pathKey)) existingPathIds.set(pathKey, track.id);
+    });
+    const loaded = await mapWithConcurrency(audioFiles, 4, async (file, idx) => {
         const relRaw = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name;
         const localPath = (file as File & { path?: string }).path;
         const rel = relRaw.split("\\").join("/");
@@ -3461,7 +3928,7 @@ export default function App() {
         const inferredYear = Number((folder + subAlbum + guessedFromName).match(/(19\d{2}|20\d{2})/)?.[1] || 0);
 
         return {
-          id: `local-${now}-${idx}`,
+          id: existingPathIds.get(normalizeTrackPathKey(localPath || rel)) || makeLocalTrackId(localPath, rel),
           title: String(tags.title || guessedFromName),
           artist: normalizeArtistList(tags.artist).join(" / ") || "Unknown Artist",
           album: String(tags.album || subAlbum || folder || "Unknown Album"),
@@ -3487,11 +3954,10 @@ export default function App() {
           lyricSources: dedupedLyricSources,
           selectedLyricSourceId: dedupedLyricSources[0]?.id
         } as Track;
-      })
-    );
+    });
 
     if (loaded.length) {
-      setTracks((prev) => [...prev, ...loaded]);
+      setTracks((prev) => mergeTracksById(prev, loaded));
       setPlayQueueIds((prev) => [...prev, ...loaded.map((track) => track.id).filter((id) => !prev.includes(id))]);
       navigateTo("songs");
       setCurrentTrackId((prev) => prev || loaded[0].id);
@@ -3511,6 +3977,32 @@ export default function App() {
     if (!paths.length || !host.electronAPI?.library?.importPaths) return;
     const result = await host.electronAPI.library.importPaths(paths);
     appendImportedTracks(result?.tracks || []);
+  };
+
+  const refreshMusicLibrary = async () => {
+    if (libraryRefreshing) return;
+    const host = window as HostWindow;
+    if (!host.electronAPI?.library?.importPaths) {
+      setTracks((prev) => [...prev]);
+      return;
+    }
+    const roots = compactImportRoots(
+      tracks
+        .map((track) => track.localPath)
+        .filter((item): item is string => Boolean(item))
+        .map((item) => getParentPath(item))
+    );
+    if (!roots.length) {
+      setTracks((prev) => [...prev]);
+      return;
+    }
+    setLibraryRefreshing(true);
+    try {
+      const result = await host.electronAPI.library.importPaths(roots);
+      appendImportedTracks(result?.tracks || [], { navigate: false });
+    } finally {
+      setLibraryRefreshing(false);
+    }
   };
 
   const createPlaylist = () => {
@@ -3676,6 +4168,10 @@ export default function App() {
     exit: { opacity: 0 },
     transition: { duration: 0.22 }
   };
+  const fullscreenHudClassName = lyricsHudVisible
+    ? "pointer-events-auto opacity-100"
+    : "pointer-events-none opacity-0";
+  const fullscreenHudTranslateClassName = lyricsHudVisible ? "translate-y-0" : "translate-y-[-4px]";
 
   const lyricScale = lyricAutoScale
     ? Math.max(0.72, Math.min(1.18, viewportSize.height / 1080))
@@ -3684,9 +4180,9 @@ export default function App() {
   const inactiveLyricSize = Math.round(activeLyricSize * 0.8);
   const activeTranslationSize = Math.round(lyricTranslationFontSize * lyricScale);
   const inactiveTranslationSize = Math.round(activeTranslationSize * 0.8);
-  const mixHorizontalBase = { coverColumn: 660, lyricColumn: 780, gap: 190, height: 720 };
+  const mixHorizontalBase = { coverColumn: 660, lyricColumn: 1040, gap: 128, height: 720 };
   const mixHorizontalBaseWidth = mixHorizontalBase.coverColumn + mixHorizontalBase.lyricColumn + mixHorizontalBase.gap;
-  const mixHorizontalAvailableWidth = Math.max(360, viewportSize.width - 180);
+  const mixHorizontalAvailableWidth = Math.max(360, viewportSize.width - 80);
   const mixHorizontalAvailableHeight = Math.max(280, viewportSize.height - 230);
   const mixHorizontalScale = Math.min(
     1,
@@ -3696,6 +4192,7 @@ export default function App() {
   const mixHorizontalCoverColumnWidth = Math.round(mixHorizontalBase.coverColumn * mixHorizontalScale);
   const mixHorizontalLyricColumnWidth = Math.round(mixHorizontalBase.lyricColumn * mixHorizontalScale);
   const mixHorizontalGap = Math.round(mixHorizontalBase.gap * mixHorizontalScale);
+  const mixHorizontalShift = Math.round(52 * mixHorizontalScale);
   const mixHorizontalCoverMaxHeight = mixHorizontalCoverColumnWidth;
   const mixHorizontalLyricScale = Math.max(0.72, Math.min(1, mixHorizontalScale));
   const lyricTextAlignClass = lyricPosition === "center" ? "text-center" : lyricPosition === "right" ? "text-right" : "text-left";
@@ -3865,7 +4362,7 @@ export default function App() {
     );
   };
 
-  const renderLyricRows = (sizeScale = 1) => {
+  const renderLyricRows = (sizeScale = 1, options: { wideText?: boolean } = {}) => {
     const displayLyrics: LyricLine[] = currentTrack ? currentLyrics : [{ time: 0, text: IDLE_TRACK_INFO.title }];
     const displayActiveLyricIndex = currentTrack ? activeLyricIndex : 0;
     const lyricScrollTopPadding = Math.round(viewportSize.height * (lyricScrollPosition / 100));
@@ -3886,6 +4383,8 @@ export default function App() {
         const distantOffset = !active && !browsingLyrics && lyricDistantView ? Math.min(18, distance * 2.2) : 0;
         const activeLayoutScaleRatio = activeLyricSize / Math.max(1, inactiveLyricSize);
         const lyricScaleRatio = active ? activeLayoutScaleRatio : 1;
+        const safeTextWidth = options.wideText ? 80 : 78;
+        const lyricRowMaxWidth = `${safeTextWidth}%`;
         const rowTransformOrigin = lyricPosition === "right" ? "right center" : lyricPosition === "center" ? "center" : "left center";
         const rowJustifyContent = lyricPosition === "right" ? "flex-end" : lyricPosition === "center" ? "center" : "flex-start";
         const estimatedMainLines = estimateWrappedLineCount(line.text, 22);
@@ -3921,7 +4420,8 @@ export default function App() {
             <span
               className={`inline-block max-w-full rounded-2xl px-4 py-2 transition-[background-color,transform] duration-500 ease-out ${lyricAutoScrolling ? "" : "hover:bg-white/10"}`}
               style={{
-                maxWidth: `${100 / activeLayoutScaleRatio}%`,
+                maxWidth: lyricRowMaxWidth,
+                boxSizing: "border-box",
                 fontWeight: active ? lyricFontWeight : Math.max(500, lyricFontWeight - 100),
                 transform: `scale(${lyricScaleRatio})`,
                 transformOrigin: rowTransformOrigin,
@@ -3984,9 +4484,19 @@ export default function App() {
     playlistId?: string;
     extraActions?: ReactNode;
   }) => {
-    const selectedInList = visible.filter((track) => selectedTrackIds.includes(track.id));
-    const allVisibleSelected = visible.length > 0 && visible.every((track) => selectedTrackIds.includes(track.id));
+    const selectedIds = new Set(selectedTrackIds);
+    const selectedInList = visible.filter((track) => selectedIds.has(track.id));
+    const allVisibleSelected = visible.length > 0 && visible.every((track) => selectedIds.has(track.id));
     const gridClassName = "grid-cols-[18px_64px_1.3fr_1fr_74px_68px]";
+    const virtualItems: VirtualTrackItem[] = [];
+    visible.forEach((track, index) => {
+      const letter = getTrackAlphaLetter(track, sortKey);
+      const previousLetter = index > 0 ? getTrackAlphaLetter(visible[index - 1], sortKey) : "";
+      if (letter !== previousLetter) {
+        virtualItems.push({ type: "alpha", key: `alpha-${pageKey}-${letter}`, letter });
+      }
+      virtualItems.push({ type: "track", key: track.id, track, index });
+    });
 
     return (
       <motion.section key={pageKey} {...PAGE_ANIMATION} transition={{ duration: 0.22 }}>
@@ -4111,53 +4621,54 @@ export default function App() {
           </div>
           <p>封面</p><p>歌曲</p><p>专辑</p><p>年份</p><p className="text-right">时长</p>
         </div>
-        <div className="space-y-1">
-          {visible.map((track, index) => {
-            const letter = getTrackAlphaLetter(track, sortKey);
-            const previousLetter = index > 0 ? getTrackAlphaLetter(visible[index - 1], sortKey) : "";
-            const showLetter = letter !== previousLetter;
-            return (
-              <div key={track.id}>
-                {showLetter && (
-                  <div
-                    id={`track-alpha-${pageKey}-${letter}`}
-                    data-alpha-letter={letter}
-                    onClick={() => setTrackAlphaPickerOpen(true)}
-                    className="sticky top-0 z-10 mb-1 cursor-pointer rounded-lg bg-[var(--bg-soft)]/92 px-3 py-2 text-xl font-black backdrop-blur transition hover:bg-[var(--surface)]"
-                  >
-                    {letter}
-                  </div>
-                )}
+        <VirtualizedTrackRows
+          pageKey={pageKey}
+          items={virtualItems}
+          scrollParentRef={mainScrollRef}
+          emptyText={emptyText}
+          renderItem={(item) => {
+            if (item.type === "alpha") {
+              return (
                 <div
-                  id={`track-row-${track.id}`}
-                  onDoubleClick={() => playTrackFromSource(track.id, visible)}
-                  onContextMenu={(e) => openTrackContext(e, track.id, playlistId)}
-                  className={`grid items-center gap-3 rounded-xl px-2 py-2 transition ${gridClassName} ${track.id === currentTrackId ? "bg-[var(--surface)]" : "hover:bg-[var(--surface)]/75"} ${track.id === locatedTrackId ? "ring-2 ring-[var(--accent)]" : ""}`}
+                  id={`track-alpha-${pageKey}-${item.letter}`}
+                  data-alpha-letter={item.letter}
+                  onClick={() => setTrackAlphaPickerOpen(true)}
+                  className="mb-1 cursor-pointer rounded-lg bg-[var(--bg-soft)]/92 px-3 py-2 text-xl font-black backdrop-blur transition hover:bg-[var(--surface)]"
                 >
-                  <div className="flex h-5 w-[18px] items-center justify-center">
-                    <AnimatePresence initial={false}>
-                      {multiSelectEnabled && (
-                        <AnimatedMaterialCheckbox
-                          checked={selectedTrackIds.includes(track.id)}
-                          onChange={() => toggleTrackSelection(track.id)}
-                        />
-                      )}
-                    </AnimatePresence>
-                  </div>
-                  {renderCoverInSlot(track.cover, track.album, 56, 56)}
-                  <div className="min-w-0">
-                    <p className="truncate font-semibold">{track.title}</p>
-                    {renderArtistLinks(track)}
-                  </div>
-                  <button type="button" onClick={(e) => { e.stopPropagation(); navigateAlbum(track.album); }} className="justify-self-start truncate text-sm text-[var(--dim)] hover:text-[var(--accent)]">{track.album}</button>
-                  <p className="text-sm text-[var(--dim)]">{track.year || "-"}</p>
-                  <p className="justify-self-end text-sm text-[var(--dim)]">{toTimeText(track.duration)}</p>
+                  {item.letter}
                 </div>
+              );
+            }
+            const { track } = item;
+            return (
+              <div
+                id={`track-row-${track.id}`}
+                onDoubleClick={() => playTrackFromSource(track.id, visible)}
+                onContextMenu={(e) => openTrackContext(e, track.id, playlistId)}
+                className={`grid items-center gap-3 rounded-xl px-2 py-2 transition ${gridClassName} ${track.id === currentTrackId ? "bg-[var(--surface)]" : "hover:bg-[var(--surface)]/75"} ${track.id === locatedTrackId ? "ring-2 ring-[var(--accent)]" : ""}`}
+              >
+                <div className="flex h-5 w-[18px] items-center justify-center">
+                  <AnimatePresence initial={false}>
+                    {multiSelectEnabled && (
+                      <AnimatedMaterialCheckbox
+                        checked={selectedIds.has(track.id)}
+                        onChange={() => toggleTrackSelection(track.id)}
+                      />
+                    )}
+                  </AnimatePresence>
+                </div>
+                {renderCoverInSlot(track.cover, track.album, 56, 56)}
+                <div className="min-w-0">
+                  <p className="truncate font-semibold">{track.title}</p>
+                  {renderArtistLinks(track)}
+                </div>
+                <button type="button" onClick={(e) => { e.stopPropagation(); navigateAlbum(track.album); }} className="justify-self-start truncate text-sm text-[var(--dim)] hover:text-[var(--accent)]">{track.album}</button>
+                <p className="text-sm text-[var(--dim)]">{track.year || "-"}</p>
+                <p className="justify-self-end text-sm text-[var(--dim)]">{toTimeText(track.duration)}</p>
               </div>
             );
-          })}
-          {!visible.length && <p className="rounded-xl border border-dashed border-[var(--line)] px-4 py-8 text-center text-sm text-[var(--dim)]">{emptyText}</p>}
-        </div>
+          }}
+        />
       </motion.section>
     );
   };
@@ -4524,7 +5035,14 @@ export default function App() {
               <p>文件夹<br /><span className="text-2xl font-bold text-[var(--text)]">{libraryStats.folders}</span></p>
               <p>总时长<br /><span className="text-2xl font-bold text-[var(--text)]">{toTimeText(libraryStats.duration)}</span></p>
             </div>
-            <button onClick={() => setTracks((prev) => [...prev])} className="mt-4 text-sm text-[var(--accent)]">刷新音乐库</button>
+            <button
+              type="button"
+              disabled={libraryRefreshing}
+              onClick={refreshMusicLibrary}
+              className="mt-4 text-sm text-[var(--accent)] disabled:cursor-wait disabled:opacity-55"
+            >
+              {libraryRefreshing ? "正在刷新..." : "刷新音乐库"}
+            </button>
           </div>
           <div className="space-y-3">
             <button className="w-full rounded-xl bg-[var(--surface)]/65 px-4 py-3 text-left">自定义文件夹</button>
@@ -4707,7 +5225,7 @@ export default function App() {
                     "进入全屏歌词时优先显示已匹配的翻译行；没有翻译时自动只显示原文",
                     <ToggleSwitch checked={translationPreference} onChange={toggleTranslationEnabled} />
                   )}
-                  <p className="text-xs text-[var(--dim)]">桌面歌词</p>
+                  <p id="desktop-lyric-settings" className="scroll-mt-6 text-xs text-[var(--dim)]">桌面歌词</p>
                   {renderSettingsRow("默认开启桌面歌词", "启动后自动显示独立桌面歌词窗口，可从托盘或歌词界面随时开关", (
                     <ToggleSwitch checked={desktopLyricOpen} onChange={() => setDesktopLyricOpen((prev) => !prev)} />
                   ))}
@@ -5005,7 +5523,7 @@ export default function App() {
             onPointerUp={endScrollbarDrag}
             onPointerCancel={endScrollbarDrag}
             onPointerLeave={endScrollbarDrag}
-            className="flex-1 overflow-y-auto px-7 pb-[112px] pt-6"
+            className="app-main-scroll flex-1 overflow-y-auto px-7 pb-[112px] pt-6"
           >
             {renderPage()}
           </main>
@@ -5031,7 +5549,7 @@ export default function App() {
               className="pointer-events-none fixed z-[91] grid h-14 w-14 place-items-center rounded-full bg-[var(--surface)]/95 text-2xl font-black shadow-2xl backdrop-blur"
               style={{
                 left: Math.max(12, trackAlphaBubble.x - 28),
-                top: Math.max(90, Math.min(window.innerHeight - 150, trackAlphaBubble.y - 28))
+                top: Math.max(12, Math.min(window.innerHeight - 68, trackAlphaBubble.y - 28))
               }}
             >
               {trackAlphaBubble.letter}
@@ -5076,6 +5594,34 @@ export default function App() {
             </motion.div>
           )}
         </AnimatePresence>
+
+        {!lyricsOpen && mainScrollbar.visible && (
+          <div
+            className="fixed z-[90] w-3"
+            style={{
+              top: mainScrollbar.top,
+              right: mainScrollbar.right,
+              height: mainScrollbar.height
+            }}
+            onPointerDown={(event) => {
+              event.preventDefault();
+              customScrollbarDraggingRef.current = true;
+              scrollbarDraggingRef.current = true;
+              setCustomScrollbarDragging(true);
+              mainPointerRef.current = { x: event.clientX, y: event.clientY };
+              scrollMainFromScrollbarY(event.clientY);
+              if (availableAlphaLetters.length) showTrackAlphaBubble(getCurrentTrackAlphaLetter());
+            }}
+          >
+            <div
+              className="absolute right-0 w-2 cursor-pointer rounded-full bg-[var(--scrollbar)] transition-colors hover:bg-[var(--accent)]"
+              style={{
+                top: mainScrollbar.thumbTop - mainScrollbar.top,
+                height: mainScrollbar.thumbHeight
+              }}
+            />
+          </div>
+        )}
 
         <footer
           className={`player-footer fixed bottom-0 left-0 right-0 z-[95] grid h-[94px] items-center border-t border-[var(--line)] bg-[var(--bg-soft)]/95 px-5 pt-2 backdrop-blur transition-opacity duration-300 ${lyricsOpen ? (lyricsHudVisible ? "opacity-100" : "pointer-events-none opacity-0") : "opacity-100"}`}
@@ -5732,7 +6278,7 @@ export default function App() {
               />
 
               <div className={`relative z-20 h-full px-10 ${theme === "dark" ? "text-white" : "text-slate-900"}`}>
-                <div className="pointer-events-none absolute left-10 right-10 top-7 z-30 flex items-start justify-between opacity-0 transition duration-200 group-hover/lyrics:pointer-events-auto group-hover/lyrics:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100">
+                <div className={`absolute left-10 right-10 top-7 z-30 flex items-start justify-between transition duration-300 ${fullscreenHudClassName} focus-within:pointer-events-auto focus-within:opacity-100`}>
                   <div className={lyricsMode === "cover" || lyricsMode.startsWith("mix") ? "opacity-0" : ""}>
                     <p className="text-4xl font-black leading-tight">{fullscreenTrackInfo.title}</p>
                     <div className={`mt-2 flex items-center gap-2 text-sm ${theme === "dark" ? "text-white/80" : "text-slate-600"}`}>
@@ -5749,7 +6295,7 @@ export default function App() {
                         : <span>{fullscreenTrackInfo.album}</span>}
                     </div>
                   </div>
-                  <div className="flex translate-y-[-4px] items-center gap-2 transition duration-200 group-hover/lyrics:translate-y-0 focus-within:translate-y-0">
+                  <div className={`flex items-center gap-2 transition duration-300 ${fullscreenHudTranslateClassName} focus-within:translate-y-0`}>
                     <IconButton
                       label="纯歌词"
                       onClick={() => setLyricsMode("lyrics")}
@@ -5785,7 +6331,7 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="pointer-events-none absolute right-8 top-1/2 z-30 flex -translate-y-1/2 flex-col items-center gap-3 opacity-0 transition duration-200 group-hover/lyrics:pointer-events-auto group-hover/lyrics:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100">
+                <div className={`absolute right-8 top-1/2 z-30 flex -translate-y-1/2 flex-col items-center gap-3 transition duration-300 ${fullscreenHudClassName} focus-within:pointer-events-auto focus-within:opacity-100`}>
                   <IconButton
                     label="复制歌词"
                     onClick={() => {
@@ -5868,7 +6414,27 @@ export default function App() {
                             ))}
                           </div>
                           <div className="mt-5 flex justify-end gap-3">
-                            <button type="button" onClick={() => setSelectedCopyLyricIndexes((currentLyrics.length ? currentLyrics : [{ time: 0, text: IDLE_TRACK_INFO.title }]).map((_, index) => index))} className="rounded-lg border border-[var(--line)] px-4 py-2">全选</button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const indexes = (currentLyrics.length ? currentLyrics : [{ time: 0, text: IDLE_TRACK_INFO.title }]).map((_, index) => index);
+                                const allSelected = indexes.length > 0 && indexes.every((index) => selectedCopyLyricIndexes.includes(index));
+                                setSelectedCopyLyricIndexes(allSelected ? [] : indexes);
+                              }}
+                              className="rounded-lg border border-[var(--line)] px-4 py-2"
+                            >
+                              {selectedCopyLyricIndexes.length === (currentLyrics.length ? currentLyrics.length : 1) ? "全不选" : "全选"}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                const indexes = (currentLyrics.length ? currentLyrics : [{ time: 0, text: IDLE_TRACK_INFO.title }]).map((_, index) => index);
+                                setSelectedCopyLyricIndexes((prev) => indexes.filter((index) => !prev.includes(index)));
+                              }}
+                              className="rounded-lg border border-[var(--line)] px-4 py-2"
+                            >
+                              反选
+                            </button>
                             <button type="button" disabled={!selectedCopyLyricIndexes.length} onClick={copyFullLyrics} className="rounded-lg bg-[var(--accent)] px-5 py-2 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-45">复制 ({selectedCopyLyricIndexes.length})</button>
                           </div>
                         </div>
@@ -5959,7 +6525,8 @@ export default function App() {
                       className="grid h-full max-w-full min-w-0 items-center"
                       style={{
                         gridTemplateColumns: `${mixHorizontalCoverColumnWidth}px minmax(0, ${mixHorizontalLyricColumnWidth}px)`,
-                        columnGap: `${mixHorizontalGap}px`
+                        columnGap: `${mixHorizontalGap}px`,
+                        transform: `translateX(${mixHorizontalShift}px)`
                       }}
                     >
                       <div className="flex min-h-0 flex-col justify-center">
@@ -5986,7 +6553,7 @@ export default function App() {
                         </motion.div>
                       </div>
                       <motion.div {...fullscreenContentFade} data-lyric-scroll onScroll={handleLyricUserScroll} className="lyric-scroll h-full min-w-0 overflow-y-auto pr-2">
-                        <div className="min-h-full w-full">{renderLyricRows(mixHorizontalLyricScale)}</div>
+                        <div className="min-h-full w-full">{renderLyricRows(mixHorizontalLyricScale, { wideText: true })}</div>
                       </motion.div>
                     </div>
                   </div>

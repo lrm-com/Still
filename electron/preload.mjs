@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld("electronAPI", {
     importFolder: () => ipcRenderer.invoke("library:import-folder"),
     importPaths: (paths) => ipcRenderer.invoke("library:import-paths", paths),
     getPathForFile: (file) => webUtils.getPathForFile(file),
+    resolveCover: (source, audioPath) => ipcRenderer.invoke("library:resolve-cover", source, audioPath),
     loadState: () => ipcRenderer.invoke("library:load-state"),
     saveState: (state) => ipcRenderer.invoke("library:save-state", state)
   },
