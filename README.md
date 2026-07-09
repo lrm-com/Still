@@ -1,4 +1,10 @@
-# Still
+<div align="center">
+
+<image src="Still/logo/Still_logo/Still_logo.png" height="28" width="28"/>
+
+<h1>Still</h1>
+<h2>静听</h2>
+<h3>此刻有声</h3>
 
 Still 是一个基于 React、Vite 和 Electron 的本地音乐播放器。
 
@@ -72,3 +78,4 @@ release/       Electron 打包输出，未提交
 这是一个仍在开发中的项目，README 会随着功能完善继续更新。
 
 由CodeX生成，测试用~
+</div>
