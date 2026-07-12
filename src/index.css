@@ -8,12 +8,6 @@
   box-sizing: border-box;
 }
 
-@property --lyric-word-progress {
-  syntax: "<percentage>";
-  inherits: true;
-  initial-value: 0%;
-}
-
 html,
 body,
 #root {
@@ -65,19 +59,45 @@ textarea,
   height: 0;
 }
 
-.lyric-word-sweep {
+.lyric-word-segments {
+  display: inline;
+}
+
+.lyric-word-piece {
+  display: inline;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
   color: transparent;
   background-image: linear-gradient(
     90deg,
     var(--lyric-word-active) 0%,
-    var(--lyric-word-active) var(--lyric-word-progress),
-    color-mix(in srgb, var(--lyric-word-active) 40%, var(--lyric-word-pending)) calc(var(--lyric-word-progress) + 1.2%),
+    var(--lyric-word-active) 50%,
+    var(--lyric-word-pending) 50%,
     var(--lyric-word-pending) 100%
   );
+  background-size: 200% 100%;
+  background-position-x: var(--lyric-word-position, 100%);
   background-clip: text;
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
-  transition: --lyric-word-progress 90ms linear;
+  transition: background-position-x 80ms linear;
+}
+
+.lyric-word-piece.with-motion {
+  display: inline-block;
+  transform: translateY(var(--lyric-word-lift, 0)) scale(var(--lyric-word-scale, 1));
+  transform-origin: center bottom;
+  transition:
+    background-position-x 80ms linear,
+    transform 80ms linear;
+}
+
+.lyric-word-tail {
+  color: var(--lyric-word-pending);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .accent-soft-action {

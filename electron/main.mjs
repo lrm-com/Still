@@ -13,6 +13,7 @@ const APP_ID = "com.still.player";
 const APP_ICON_PATH = path.join(__dirname, "../logo/Still_logo_white/Still_logo_white_rounded.ico");
 const AUDIO_EXTENSIONS = new Set([".mp3", ".flac", ".wav", ".ogg", ".m4a", ".aac"]);
 const STORE_FILE = "still-library.json";
+const WINDOW_STATE_FILE = "still-window-state.json";
 const METADATA_CACHE_FILE = "still-metadata-cache.json";
 const COVER_CACHE_DIR = "cover-cache";
 const IMPORT_CONCURRENCY = Math.max(2, Math.min(4, Number(process.env.STILL_IMPORT_CONCURRENCY || 4)));
@@ -23,6 +24,10 @@ if (process.platform === "win32") app.setAppUserModelId(APP_ID);
 let mainWindow = null;
 let desktopLyricWindow = null;
 let desktopLyricLockedState = false;
+let desktopLyricDragState = null;
+let desktopLyricControlsInteractive = false;
+let desktopLyricSavedBounds = null;
+let desktopLyricBoundsLoaded = false;
 let tray = null;
 let isQuitting = false;
 const thumbarIconCache = new Map();
@@ -159,6 +164,29 @@ async function dataUrlToCoverUrl(dataUrl, cacheKey) {
   return bufferToCoverUrl(Buffer.from(match[2], "base64"), match[1], cacheKey);
 }
 
+function formatLrcTimestampMs(timestamp) {
+  const totalMs = Math.max(0, Math.round(Number(timestamp) || 0));
+  const minutes = Math.floor(totalMs / 60000);
+  const seconds = Math.floor((totalMs % 60000) / 1000);
+  const milliseconds = totalMs % 1000;
+  return `[${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(milliseconds).padStart(3, "0")}]`;
+}
+
+function syncTextToLrc(syncText) {
+  if (!Array.isArray(syncText)) return "";
+  return syncText
+    .map((item) => {
+      if (!item || typeof item !== "object") return "";
+      const timestamp = Number(item.timestamp);
+      const text = normalizeTagText(item.text ?? item.lyrics ?? item.value ?? item.description);
+      if (!Number.isFinite(timestamp) || !text) return "";
+      return `${formatLrcTimestampMs(timestamp)}${text}`;
+    })
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
 function normalizeTagText(value) {
   if (typeof value === "string") return value.trim();
   if (typeof value === "number") return String(value);
@@ -167,6 +195,8 @@ function normalizeTagText(value) {
     return value.map((item) => normalizeTagText(item)).filter(Boolean).join("\n").trim();
   }
   if (value && typeof value === "object") {
+    const syncedText = syncTextToLrc(value.syncText);
+    if (syncedText) return syncedText;
     const direct = value.text ?? value.lyrics ?? value.value ?? value.description;
     const directText = normalizeTagText(direct);
     if (directText) return directText;
@@ -500,6 +530,67 @@ async function writePersistedState(state) {
   return true;
 }
 
+async function getWindowStatePath() {
+  const dir = app.getPath("userData");
+  await fs.mkdir(dir, { recursive: true });
+  return path.join(dir, WINDOW_STATE_FILE);
+}
+
+function normalizeDesktopLyricBounds(bounds) {
+  if (!bounds || typeof bounds !== "object") return null;
+  const x = Math.round(Number(bounds.x));
+  const y = Math.round(Number(bounds.y));
+  const width = Math.round(Number(bounds.width));
+  const height = Math.round(Number(bounds.height));
+  if (![x, y, width, height].every(Number.isFinite)) return null;
+  if (width < 520 || height < 116) return null;
+  return { x, y, width, height };
+}
+
+async function loadDesktopLyricBounds() {
+  if (desktopLyricBoundsLoaded) return desktopLyricSavedBounds;
+  desktopLyricBoundsLoaded = true;
+  try {
+    const raw = await fs.readFile(await getWindowStatePath(), "utf8");
+    const state = JSON.parse(raw);
+    desktopLyricSavedBounds = normalizeDesktopLyricBounds(state?.desktopLyricBounds);
+  } catch {
+    desktopLyricSavedBounds = null;
+  }
+  return desktopLyricSavedBounds;
+}
+
+async function saveDesktopLyricBounds(bounds) {
+  const nextBounds = normalizeDesktopLyricBounds(bounds);
+  if (!nextBounds) return false;
+  desktopLyricSavedBounds = nextBounds;
+  desktopLyricBoundsLoaded = true;
+  let state = {};
+  try {
+    state = JSON.parse(await fs.readFile(await getWindowStatePath(), "utf8"));
+  } catch {
+    state = {};
+  }
+  state.desktopLyricBounds = nextBounds;
+  await fs.writeFile(await getWindowStatePath(), JSON.stringify(state), "utf8");
+  return true;
+}
+
+function rememberDesktopLyricBounds(bounds) {
+  const nextBounds = normalizeDesktopLyricBounds(bounds);
+  if (nextBounds) {
+    desktopLyricSavedBounds = nextBounds;
+    desktopLyricBoundsLoaded = true;
+  }
+  return nextBounds;
+}
+
+function captureDesktopLyricBounds() {
+  if (!desktopLyricWindow || desktopLyricWindow.isDestroyed()) return;
+  const bounds = rememberDesktopLyricBounds(desktopLyricWindow.getBounds());
+  if (bounds) void saveDesktopLyricBounds(bounds).catch(() => {});
+}
+
 function makeTrayIcon() {
   return nativeImage.createFromPath(APP_ICON_PATH).resize({ width: 16, height: 16 });
 }
@@ -670,10 +761,21 @@ function sendPlayerCommand(command, options = {}) {
 
 function applyDesktopLyricLock(locked, notify = false) {
   desktopLyricLockedState = Boolean(locked);
+  if (!desktopLyricLockedState) desktopLyricControlsInteractive = false;
   if (!desktopLyricWindow || desktopLyricWindow.isDestroyed()) return;
+  applyDesktopLyricMouseEvents();
   if (notify) {
     desktopLyricWindow.webContents.send("desktop-lyrics:data", { locked: desktopLyricLockedState });
   }
+}
+
+function applyDesktopLyricMouseEvents() {
+  if (!desktopLyricWindow || desktopLyricWindow.isDestroyed()) return;
+  if (!desktopLyricLockedState || desktopLyricControlsInteractive) {
+    desktopLyricWindow.setIgnoreMouseEvents(false);
+    return;
+  }
+  desktopLyricWindow.setIgnoreMouseEvents(true, { forward: true });
 }
 
 function updateTrayMenu() {
@@ -705,7 +807,10 @@ function updateTrayMenu() {
       label: "退出",
       click: () => {
         isQuitting = true;
-        if (desktopLyricWindow && !desktopLyricWindow.isDestroyed()) desktopLyricWindow.destroy();
+        if (desktopLyricWindow && !desktopLyricWindow.isDestroyed()) {
+          captureDesktopLyricBounds();
+          desktopLyricWindow.destroy();
+        }
         app.quit();
       }
     }
@@ -721,9 +826,12 @@ function createTray() {
 
 function createDesktopLyricWindow() {
   if (desktopLyricWindow && !desktopLyricWindow.isDestroyed()) return desktopLyricWindow;
+  const savedBounds = normalizeDesktopLyricBounds(desktopLyricSavedBounds);
   desktopLyricWindow = new BrowserWindow({
-    width: 920,
-    height: 170,
+    width: savedBounds?.width || 920,
+    height: savedBounds?.height || 170,
+    x: savedBounds?.x,
+    y: savedBounds?.y,
     minWidth: 520,
     minHeight: 116,
     frame: false,
@@ -749,17 +857,20 @@ function createDesktopLyricWindow() {
 <head>
   <meta charset="utf-8" />
   <style>
-    @property --word-progress { syntax: "<percentage>"; inherits: true; initial-value: 0%; }
     html, body { margin: 0; width: 100%; height: 100%; background: transparent !important; overflow: hidden; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; user-select: none; -webkit-user-select: none; }
-    #app { height: 100%; display: flex; align-items: center; padding: 10px; box-sizing: border-box; background: transparent !important; }
-    .panel { -webkit-app-region: drag; position: relative; isolation: isolate; contain: paint; width: 100%; min-height: 88px; border: 1px solid rgba(255,255,255,.16); border-radius: 18px; background: rgba(8,10,18,.58); background-clip: padding-box; box-shadow: inset 0 1px 0 rgba(255,255,255,.14), inset 0 -1px 0 rgba(0,0,0,.18); backdrop-filter: blur(18px); padding: 12px 14px; color: white; box-sizing: border-box; overflow: hidden; user-select: none; -webkit-user-select: none; transition: background .18s ease, border-color .18s ease, box-shadow .18s ease, backdrop-filter .18s ease; }
-    .panel.idle { background: rgba(8,10,18,.01); border-color: transparent; box-shadow: none; backdrop-filter: none; }
+    #app { height: 100%; display: flex; align-items: center; justify-content: center; padding: 10px; box-sizing: border-box; background: transparent !important; }
+    .panel { -webkit-app-region: no-drag; position: relative; isolation: isolate; contain: paint; width: min(760px, 100%); min-height: 88px; border: 1px solid rgba(255,255,255,.16); border-radius: 18px; background: rgba(8,10,18,.58); background-clip: padding-box; box-shadow: inset 0 1px 0 rgba(255,255,255,.14), inset 0 -1px 0 rgba(0,0,0,.18); backdrop-filter: blur(18px); padding: 12px 14px; color: white; box-sizing: border-box; overflow: hidden; user-select: none; -webkit-user-select: none; transition: background .18s ease, border-color .18s ease, box-shadow .18s ease, backdrop-filter .18s ease; }
+    .panel.idle { background: transparent; border-color: transparent; box-shadow: none; backdrop-filter: none; }
     .panel.idle .top { opacity: 0; pointer-events: none; }
-    .panel.idle.controls-active .top { opacity: 1; pointer-events: auto; }
     .locked { background: transparent; border-color: transparent; box-shadow: none; backdrop-filter: none; }
-    .locked, .locked .top, .locked .lyric, .locked .translation { -webkit-app-region: no-drag; }
+    .locked, .locked .top, .locked .lyrics-viewport, .locked .desktop-line, .locked .line-scroll, .locked .line-word { -webkit-app-region: no-drag; }
     .locked.idle { background: transparent; border-color: transparent; box-shadow: none; backdrop-filter: none; }
-    .top { -webkit-app-region: drag; position: relative; display: flex; align-items: center; justify-content: space-between; gap: 12px; transition: opacity .16s ease; }
+    .locked.idle .playback-controls, .locked.idle .window-controls, .locked.idle button { pointer-events: none; }
+    .locked:not(.idle) .top { opacity: 1; pointer-events: none; }
+    .locked:not(.idle) .meta { opacity: 1; pointer-events: none; }
+    .locked:not(.idle) .playback-controls, .locked:not(.idle) .window-controls, .locked:not(.idle) .playback-controls button, .locked:not(.idle) .window-controls button { opacity: 1; pointer-events: auto; }
+    .top { -webkit-app-region: no-drag; position: relative; display: flex; align-items: center; justify-content: space-between; gap: 12px; transition: opacity .16s ease; }
+    .panel:not(.locked), .panel:not(.locked) .top, .panel:not(.locked) .lyrics-viewport { cursor: move; }
     .meta { display: flex; align-items: center; min-width: 0; gap: 10px; }
     .cover-box { width: 40px; height: 40px; border-radius: 8px; background: rgba(255,255,255,.1); color: rgba(255,255,255,.66); display: grid; place-items: center; overflow: hidden; flex: 0 0 auto; }
     .cover-box img { width: 100%; height: 100%; object-fit: cover; display: block; }
@@ -778,25 +889,17 @@ function createDesktopLyricWindow() {
     button:hover { border-color: rgba(255,255,255,.42); }
     button:focus { outline: none; }
     button:focus-visible { outline: 2px solid rgba(255,255,255,.45); outline-offset: 2px; }
-    .lyric { -webkit-app-region: drag; position: relative; margin-top: 10px; min-height: calc(var(--font-size, 30px) * 1.48); padding: 5px 0 8px; overflow: hidden; box-sizing: content-box; }
-    .translation { -webkit-app-region: drag; position: relative; margin-top: 3px; min-height: calc(var(--second-line-size, 24px) * 1.42); padding: 3px 0 7px; overflow: hidden; box-sizing: content-box; }
-    .desktop-line { display: block; width: 100%; text-align: center; font-size: var(--font-size, 30px); line-height: 1.24; font-weight: var(--font-weight, 700); color: var(--played-color, #00b7c3); -webkit-text-stroke: 1px var(--stroke-color, rgba(0,0,0,.69)); paint-order: stroke fill; text-shadow: 1px 0 0 var(--stroke-color, rgba(0,0,0,.69)), -1px 0 0 var(--stroke-color, rgba(0,0,0,.69)), 0 1px 0 var(--stroke-color, rgba(0,0,0,.69)), 0 -1px 0 var(--stroke-color, rgba(0,0,0,.69)), 1px 1px 0 var(--stroke-color, rgba(0,0,0,.69)), -1px 1px 0 var(--stroke-color, rgba(0,0,0,.69)), 1px -1px 0 var(--stroke-color, rgba(0,0,0,.69)), -1px -1px 0 var(--stroke-color, rgba(0,0,0,.69)); white-space: nowrap; overflow: visible; text-overflow: clip; transition: color .16s ease, text-shadow .16s ease, -webkit-text-stroke-color .16s ease, --word-progress .06s linear; will-change: opacity, transform; transform: translate3d(0,0,0); backface-visibility: hidden; -webkit-font-smoothing: antialiased; text-rendering: geometricPrecision; }
-    .desktop-line.current { position: relative; }
-    .desktop-line.ghost { position: absolute; left: 0; right: 0; top: 0; height: auto; opacity: 0; transform: translate3d(0,28px,0); pointer-events: none; }
-    .measure-line { position: absolute; left: -99999px; top: -99999px; width: auto; min-width: 0; visibility: hidden; pointer-events: none; }
-    .lyric > .desktop-line.ghost { top: 3px; }
-    .translation > .desktop-line.ghost { top: 2px; }
-    .desktop-line.no-transition { transition: none !important; }
-    .desktop-line.out { opacity: 0; transform: translate3d(0,-22px,0); }
-    .desktop-line.in { opacity: 1; transform: translate3d(0,0,0); }
-    .desktop-line.word { position: relative; color: transparent; -webkit-text-fill-color: transparent; -webkit-text-stroke: 0 transparent; text-shadow: none; background: none; filter: none; }
-    .desktop-line.word::before, .desktop-line.word::after { content: attr(data-text); position: absolute; inset: 0; width: 100%; overflow: hidden; -webkit-text-stroke: 1px var(--stroke-color, rgba(0,0,0,.69)); paint-order: stroke fill; text-shadow: 1px 0 0 var(--stroke-color, rgba(0,0,0,.69)), -1px 0 0 var(--stroke-color, rgba(0,0,0,.69)), 0 1px 0 var(--stroke-color, rgba(0,0,0,.69)), 0 -1px 0 var(--stroke-color, rgba(0,0,0,.69)), 1px 1px 0 var(--stroke-color, rgba(0,0,0,.69)), -1px 1px 0 var(--stroke-color, rgba(0,0,0,.69)), 1px -1px 0 var(--stroke-color, rgba(0,0,0,.69)), -1px -1px 0 var(--stroke-color, rgba(0,0,0,.69)); white-space: nowrap; text-align: inherit; pointer-events: none; }
-    .desktop-line.word::before { clip-path: inset(0 0 0 var(--word-progress, 0%)); color: var(--pending-color, #ccc); -webkit-text-fill-color: var(--pending-color, #ccc); }
-    .desktop-line.word::after { clip-path: inset(0 calc(100% - var(--word-progress, 0%)) 0 0); color: var(--played-color, #00b7c3); -webkit-text-fill-color: var(--played-color, #00b7c3); }
-    .translation .desktop-line { font-size: var(--second-line-size, 24px); font-weight: 700; color: var(--pending-color, #ccc); }
-    .translation.empty { display: none; }
-    .translation.promoting { overflow: visible; }
-    .promotion-line { position: absolute; z-index: 3; opacity: 0; pointer-events: none; transform-origin: center center; contain: paint; overflow: visible; text-overflow: clip; }
+    .lyrics-viewport { -webkit-app-region: no-drag; position: relative; margin-top: 10px; min-height: calc(var(--font-size, 30px) * 1.5 + var(--second-line-size, 24px) * 1.46 + 6px); padding: 5px 0 8px; overflow: hidden; box-sizing: content-box; transition: min-height .22s ease; }
+    .lyrics-viewport.single { min-height: calc(var(--font-size, 30px) * 1.5); }
+    .desktop-line { position: absolute; left: 0; right: 0; top: 0; display: block; width: 100%; height: calc(var(--font-size, 30px) * 1.34); text-align: center; font-size: var(--font-size, 30px); line-height: 1.24; font-weight: var(--font-weight, 700); color: var(--played-color, #00b7c3); white-space: nowrap; overflow: hidden; text-overflow: clip; transition: top .44s cubic-bezier(.22,1,.36,1), opacity .32s ease, transform .44s cubic-bezier(.22,1,.36,1), color .16s ease, font-size .22s ease, height .22s ease; will-change: top, opacity, transform; transform: translate3d(0,0,0); backface-visibility: hidden; -webkit-font-smoothing: antialiased; text-rendering: geometricPrecision; }
+    .desktop-line.secondary { height: calc(var(--second-line-size, 24px) * 1.32); font-size: var(--second-line-size, 24px); color: var(--pending-color, #ccc); }
+    .desktop-line.leaving { opacity: 0; transform: translate3d(0,-24px,0); pointer-events: none; }
+    .desktop-line.entering { opacity: 0; transform: translate3d(0,24px,0); }
+    .desktop-line.no-animation { transition: none !important; }
+    .line-scroll { display: inline-block; max-width: none; white-space: nowrap; will-change: transform; transform: translate3d(0,0,0); backface-visibility: hidden; -webkit-text-stroke: 1px var(--stroke-color, rgba(0,0,0,.69)); paint-order: stroke fill; text-shadow: 1px 0 0 var(--stroke-color, rgba(0,0,0,.69)), -1px 0 0 var(--stroke-color, rgba(0,0,0,.69)), 0 1px 0 var(--stroke-color, rgba(0,0,0,.69)), 0 -1px 0 var(--stroke-color, rgba(0,0,0,.69)), 1px 1px 0 var(--stroke-color, rgba(0,0,0,.69)), -1px 1px 0 var(--stroke-color, rgba(0,0,0,.69)), 1px -1px 0 var(--stroke-color, rgba(0,0,0,.69)), -1px -1px 0 var(--stroke-color, rgba(0,0,0,.69)); }
+    .line-scroll.word { -webkit-text-stroke: 0 transparent; text-shadow: none; }
+    .line-word { display: inline; white-space: pre; color: transparent; -webkit-text-fill-color: transparent; -webkit-text-stroke: 1px var(--stroke-color, rgba(0,0,0,.69)); paint-order: stroke fill; background-image: linear-gradient(90deg, var(--played-color, #00b7c3) 0%, var(--played-color, #00b7c3) 50%, var(--pending-color, #ccc) 50%, var(--pending-color, #ccc) 100%); background-size: 200% 100%; background-position-x: var(--word-position, 100%); background-clip: text; -webkit-background-clip: text; filter: drop-shadow(0 0 1px var(--stroke-color, rgba(0,0,0,.69))) drop-shadow(0 0 2px var(--stroke-color, rgba(0,0,0,.69))); transition: background-position-x .06s linear; }
+    .line-word.with-motion { display: inline-block; transform: translateY(var(--word-lift, 0)) scale(var(--word-scale, 1)); transform-origin: center bottom; transition: background-position-x .06s linear, transform .06s linear; }
   </style>
 </head>
 <body>
@@ -827,421 +930,318 @@ function createDesktopLyricWindow() {
           <button title="Close" onclick="window.electronAPI.desktopLyrics.sendCommand('close')"><svg viewBox="0 0 24 24"><path d="M18 6 6 18"></path><path d="m6 6 12 12"></path></svg></button>
         </div>
       </div>
-      <div id="lyric" class="lyric">
-        <span id="lyricCurrent" class="desktop-line current">...</span>
-        <span id="lyricGhost" class="desktop-line ghost"></span>
-      </div>
-      <div id="translation" class="translation">
-        <span id="translationCurrent" class="desktop-line current"></span>
-        <span id="translationGhost" class="desktop-line ghost"></span>
-      </div>
-      <span id="promotedLine" class="desktop-line promotion-line"></span>
-      <span id="lineMeasure" class="desktop-line measure-line"></span>
+      <div id="lyricsViewport" class="lyrics-viewport single"></div>
     </div>
   </div>
   <script>
     const appRoot = document.getElementById('app');
     const panel = document.getElementById('panel');
-    const translation = document.getElementById('translation');
-    let idleTimer = 0;
-    let pointerInside = false;
+    let hideTimer = 0;
+    let locked = false;
     let pointerOnControls = false;
-    const setIdle = (idle) => panel.classList.toggle('idle', idle);
-    const setControlsActive = (active) => panel.classList.toggle('controls-active', active);
-    const queueIdle = (delay = 1050) => {
-      window.clearTimeout(idleTimer);
-      idleTimer = window.setTimeout(() => {
-        if (!pointerOnControls) setIdle(true);
-      }, delay);
+    let draggingWindow = false;
+    let dragPointerId = null;
+    let lastControlsInteractive = false;
+    const setIdle = (idle) => {
+      panel.classList.toggle('idle', idle);
+      panel.classList.toggle('hovered', !idle);
     };
-    const showPanel = () => {
-      pointerInside = true;
-      window.clearTimeout(idleTimer);
+    const setControlsActive = (active) => panel.classList.toggle('controls-active', active);
+    const controlGroups = Array.from(document.querySelectorAll('.playback-controls, .window-controls'));
+    const controlButtons = Array.from(document.querySelectorAll('.playback-controls button, .window-controls button'));
+    const isControlsNode = (node) => Boolean(node?.closest?.('.playback-controls, .window-controls'));
+    const isControlsPoint = (event) => controlButtons.some((node) => {
+      const rect = node.getBoundingClientRect();
+      return event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom;
+    });
+    const hideChrome = () => {
+      window.clearTimeout(hideTimer);
+      pointerOnControls = false;
+      setControlsActive(false);
+      syncControlsInteractivity();
+      setIdle(true);
+    };
+    const showChrome = (hideDelay = 1000) => {
+      window.clearTimeout(hideTimer);
       setIdle(false);
-      if (!pointerOnControls) queueIdle();
+      setControlsActive(pointerOnControls);
+      hideTimer = window.setTimeout(hideChrome, hideDelay);
+    };
+    const updatePointerTarget = (event) => {
+      pointerOnControls = isControlsNode(event.target) || isControlsPoint(event);
+      showChrome();
+      syncControlsInteractivity();
+    };
+    const dragPoint = (event) => ({ screenX: event.screenX, screenY: event.screenY });
+    const canDragWindow = (event) => {
+      if (locked || event.button !== 0 || isControlsNode(event.target)) return false;
+      return appRoot.contains(event.target);
+    };
+    const syncControlsInteractivity = () => {
+      const next = Boolean(locked && pointerOnControls);
+      if (next === lastControlsInteractive) return;
+      lastControlsInteractive = next;
+      window.electronAPI.desktopLyrics.controlsHover(next);
+    };
+    const stopWindowDrag = (event) => {
+      if (event?.pointerId !== undefined && dragPointerId !== null && event.pointerId !== dragPointerId) return;
+      const wasDragging = draggingWindow;
+      draggingWindow = false;
+      document.removeEventListener('pointermove', moveWindowDrag);
+      document.removeEventListener('pointerup', stopWindowDrag);
+      document.removeEventListener('pointercancel', stopWindowDrag);
+      dragPointerId = null;
+      if (wasDragging) window.electronAPI.desktopLyrics.dragEnd();
+    };
+    const moveWindowDrag = (event) => {
+      if (!draggingWindow || event.pointerId !== dragPointerId) return;
+      if (event.buttons === 0) {
+        stopWindowDrag(event);
+        return;
+      }
+      window.electronAPI.desktopLyrics.dragMove(dragPoint(event));
+      event.preventDefault();
+    };
+    const startWindowDrag = (event) => {
+      updatePointerTarget(event);
+      if (!canDragWindow(event)) return;
+      draggingWindow = true;
+      dragPointerId = event.pointerId;
+      document.addEventListener('pointermove', moveWindowDrag);
+      document.addEventListener('pointerup', stopWindowDrag);
+      document.addEventListener('pointercancel', stopWindowDrag);
+      window.electronAPI.desktopLyrics.dragStart(dragPoint(event));
+      event.preventDefault();
     };
     const scheduleIdle = () => {
-      pointerInside = false;
-      queueIdle(650);
+      if (!draggingWindow) {
+        dragPointerId = null;
+        hideChrome();
+      }
     };
-    appRoot.addEventListener('pointerenter', showPanel);
-    appRoot.addEventListener('pointerover', showPanel);
-    appRoot.addEventListener('mousemove', showPanel);
+    appRoot.addEventListener('pointerenter', updatePointerTarget);
+    appRoot.addEventListener('pointerover', updatePointerTarget);
+    appRoot.addEventListener('mousemove', updatePointerTarget);
     appRoot.addEventListener('pointerleave', scheduleIdle);
-    document.addEventListener('mousemove', showPanel);
-    document.querySelectorAll('.playback-controls, .window-controls').forEach((node) => {
-      node.addEventListener('pointerenter', () => {
-        pointerOnControls = true;
-        setControlsActive(true);
-        showPanel();
+    document.addEventListener('mousemove', updatePointerTarget);
+    document.addEventListener('mouseleave', scheduleIdle);
+    controlGroups.forEach((node) => {
+      node.addEventListener('pointerenter', (event) => {
+        updatePointerTarget(event);
       });
       node.addEventListener('pointerleave', () => {
         pointerOnControls = false;
         setControlsActive(false);
-        scheduleIdle();
+        showChrome(300);
+        syncControlsInteractivity();
       });
-      node.addEventListener('pointerdown', showPanel);
+      node.addEventListener('pointerdown', (event) => {
+        updatePointerTarget(event);
+      });
     });
-    scheduleIdle();
+    appRoot.addEventListener('pointerdown', startWindowDrag);
+    window.addEventListener('blur', stopWindowDrag);
+    hideChrome();
 
-    const lyric = document.getElementById('lyric');
-    const lyricCurrent = document.getElementById('lyricCurrent');
-    const lyricGhost = document.getElementById('lyricGhost');
-    const translationCurrent = document.getElementById('translationCurrent');
-    const translationGhost = document.getElementById('translationGhost');
-    const promotedLine = document.getElementById('promotedLine');
-    const lineMeasure = document.getElementById('lineMeasure');
-    const animationTimers = new WeakMap();
-    const animationTokens = new WeakMap();
-    const pendingTexts = new WeakMap();
-    const marqueeAnimations = new WeakMap();
-    const marqueeFrames = new WeakMap();
-    let pairPending = null;
-    let lastPrimaryText = '';
-    let lastSecondText = '';
-    const clearMarquee = (node) => {
-      const frame = marqueeFrames.get(node);
-      if (frame) window.cancelAnimationFrame(frame);
-      marqueeFrames.delete(node);
-      const animation = marqueeAnimations.get(node);
-      if (animation) animation.cancel();
-      marqueeAnimations.delete(node);
-      delete node.dataset.marquee;
-      node.style.transform = '';
+    const lyricsViewport = document.getElementById('lyricsViewport');
+    const lyricEntries = new Map();
+    let latestLineSpecs = [];
+    let seekBase = 0;
+    let seekAnchor = performance.now();
+    let seekInitialized = false;
+    let seekPlaying = false;
+    let scrollFrame = 0;
+
+    const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+    const cssNumber = (name, fallback) => {
+      const value = Number.parseFloat(getComputedStyle(panel).getPropertyValue(name));
+      return Number.isFinite(value) ? value : fallback;
     };
-    const updateMarquee = (node, delay = 720) => {
-      if (!node || node.classList.contains('ghost') || node === promotedLine) return;
-      clearMarquee(node);
-      const frame = window.requestAnimationFrame(() => {
-        marqueeFrames.delete(node);
-        if (!node.textContent || node.style.opacity === '0') return;
-        const style = getComputedStyle(node);
-        lineMeasure.textContent = node.textContent;
-        lineMeasure.style.fontFamily = style.fontFamily;
-        lineMeasure.style.fontSize = style.fontSize;
-        lineMeasure.style.fontWeight = style.fontWeight;
-        lineMeasure.style.letterSpacing = style.letterSpacing;
-        lineMeasure.style.lineHeight = style.lineHeight;
-        const textWidth = lineMeasure.getBoundingClientRect().width + 12;
-        const overflow = textWidth - node.clientWidth;
-        if (overflow <= 8) return;
-        node.dataset.marquee = 'true';
-        node.classList.remove('word');
-        node.style.removeProperty('--word-progress');
-        const distance = Math.ceil(overflow / 2) + 18;
-        const duration = Math.max(7200, Math.min(22000, (overflow + node.clientWidth) * 30));
-        const animation = node.animate([
-          { transform: 'translate3d(' + distance + 'px,0,0)', offset: 0 },
-          { transform: 'translate3d(' + distance + 'px,0,0)', offset: 0.12 },
-          { transform: 'translate3d(-' + distance + 'px,0,0)', offset: 0.88 },
-          { transform: 'translate3d(-' + distance + 'px,0,0)', offset: 1 }
-        ], {
-          delay,
-          duration,
-          iterations: Infinity,
-          easing: 'linear'
+    const getSeek = () => seekPlaying ? seekBase + (performance.now() - seekAnchor) / 1000 : seekBase;
+    const lineTop = (index) => index === 0 ? 0 : Math.round(cssNumber('--font-size', 30) * 1.48 + 5);
+    const lineHeight = (index) => {
+      const size = index === 0 ? cssNumber('--font-size', 30) : cssNumber('--second-line-size', 24);
+      return Math.round(size * 1.34);
+    };
+    const syncSeek = (data) => {
+      const next = Number(data.lyricTime ?? data.currentTime);
+      if (!Number.isFinite(next)) return;
+      const corrected = Number.isFinite(Number(data.sentAt)) ? next + clamp((Date.now() - Number(data.sentAt)) / 1000, 0, 1) : next;
+      const drift = Math.abs(corrected - getSeek());
+      const shouldReset = !seekInitialized || drift > 0.3 || Boolean(data.forceSeekSync);
+      if (shouldReset || !data.isPlaying) {
+        seekBase = corrected;
+        seekAnchor = performance.now();
+        seekInitialized = true;
+      }
+      seekPlaying = Boolean(data.isPlaying);
+      if (!seekPlaying) {
+        seekBase = corrected;
+        seekAnchor = performance.now();
+      }
+    };
+    const makeLineKey = (prefix, text, start) => {
+      const timePart = Number.isFinite(Number(start)) ? Number(start).toFixed(3) : 'idle';
+      return prefix + ':' + timePart + ':' + String(text || '').slice(0, 36);
+    };
+    const getWordProgress = (word) => {
+      const start = Number(word?.time);
+      const end = Number(word?.endTime);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return 0;
+      return clamp((getSeek() - start) / Math.max(0.08, end - start), 0, 1);
+    };
+    const paintWordNode = (node, word, spec) => {
+      const progress = getWordProgress(word);
+      node.style.setProperty('--word-position', (100 - progress * 100) + '%');
+      node.style.setProperty('--word-lift', spec?.wordLiftEffect ? (-2 * progress) + 'px' : '0px');
+      node.style.setProperty('--word-scale', spec?.wordScaleEffect ? String(1 + 0.06 * progress) : '1');
+    };
+    const setScrollContent = (entry, spec) => {
+      const next = spec.text || '';
+      const words = Array.isArray(spec.words) ? spec.words : [];
+      const nextSignature = spec.wordByWord && words.length ? words.map((word) => word.text + '@' + word.time + '-' + word.endTime).join('|') : next;
+      if (entry.text === next && entry.signature === nextSignature) return;
+      entry.text = next;
+      entry.signature = nextSignature;
+      entry.scroll.textContent = '';
+      entry.scroll.dataset.text = next;
+      if (spec.wordByWord && spec.active && words.length) {
+        words.forEach((word) => {
+          const node = document.createElement('span');
+          node.className = 'line-word' + (spec.wordLiftEffect || spec.wordScaleEffect ? ' with-motion' : '');
+          node.textContent = word.text || '';
+          paintWordNode(node, word, spec);
+          entry.scroll.appendChild(node);
         });
-        marqueeAnimations.set(node, animation);
-      });
-      marqueeFrames.set(node, frame);
-    };
-    const setLineText = (node, value) => {
-      const text = value || '';
-      node.textContent = text;
-      node.dataset.text = text;
-    };
-    const clearAnimation = (current, ghost) => {
-      clearMarquee(current);
-      clearMarquee(ghost);
-      const timers = animationTimers.get(current);
-      if (timers?.settleTimer) window.clearTimeout(timers.settleTimer);
-      if (timers?.outAnimation) timers.outAnimation.cancel();
-      if (timers?.inAnimation) timers.inAnimation.cancel();
-      current.classList.remove('out', 'no-transition');
-      ghost.classList.remove('in', 'no-transition');
-      current.style.opacity = '';
-      current.style.transform = '';
-      current.style.transformOrigin = '';
-      current.style.fontSize = '';
-      current.style.lineHeight = '';
-      current.style.height = '';
-      current.style.fontWeight = '';
-      current.style.color = '';
-      current.style.removeProperty('--word-progress');
-      ghost.style.opacity = '';
-      ghost.style.transform = '';
-      ghost.style.transformOrigin = '';
-      ghost.style.fontSize = '';
-      ghost.style.lineHeight = '';
-      ghost.style.height = '';
-      ghost.style.fontWeight = '';
-      ghost.style.color = '';
-      ghost.style.removeProperty('--word-progress');
-      setLineText(ghost, '');
-      animationTimers.delete(current);
-      animationTokens.delete(current);
-    };
-    const setText = (current, ghost, value, animated) => {
-      const next = value || '';
-      if (pendingTexts.get(current) === next) return;
-      if (current.textContent === next && !pendingTexts.has(current)) {
-        if (!marqueeAnimations.has(current) && !marqueeFrames.has(current)) updateMarquee(current);
-        return;
-      }
-      if (!animated) {
-        clearAnimation(current, ghost);
-        pendingTexts.delete(current);
-        setLineText(current, next);
-        updateMarquee(current);
-        return;
-      }
-      clearAnimation(current, ghost);
-      const token = Symbol('desktop-lyric-transition');
-      pendingTexts.set(current, next);
-      animationTokens.set(current, token);
-      setLineText(ghost, next);
-      const currentHeight = current.getBoundingClientRect().height || Number.parseFloat(getComputedStyle(current).fontSize) || 40;
-      const slide = Math.max(18, Math.min(42, currentHeight * 0.62));
-      const duration = 430;
-      const timing = { duration, easing: 'cubic-bezier(.22,1,.36,1)', fill: 'forwards' };
-      const incomingWordProgress = getComputedStyle(current).getPropertyValue('--word-progress') || '0%';
-      current.style.opacity = '1';
-      current.style.transform = 'translate3d(0,0,0)';
-      ghost.style.opacity = '0';
-      ghost.style.transform = 'translate3d(0,' + slide + 'px,0)';
-      if (current.classList.contains('word')) {
-        current.style.setProperty('--word-progress', '100%');
-        ghost.style.setProperty('--word-progress', incomingWordProgress);
-      }
-      void ghost.offsetWidth;
-      const outAnimation = current.animate([
-        { opacity: 1, transform: 'translate3d(0,0,0)' },
-        { opacity: 0, transform: 'translate3d(0,-' + slide + 'px,0)' }
-      ], timing);
-      const inAnimation = ghost.animate([
-        { opacity: 0, transform: 'translate3d(0,' + slide + 'px,0)' },
-        { opacity: 1, transform: 'translate3d(0,0,0)' }
-      ], timing);
-      const settle = () => {
-        if (animationTokens.get(current) !== token) return;
-        setLineText(current, next);
-        current.style.opacity = '1';
-        current.style.transform = 'translate3d(0,0,0)';
-        ghost.style.opacity = '0';
-        ghost.style.transform = 'translate3d(0,0,0)';
-        outAnimation.cancel();
-        inAnimation.cancel();
-        current.style.opacity = '';
-        current.style.transform = '';
-        current.style.lineHeight = '';
-        current.style.height = '';
-        current.style.fontWeight = '';
-        current.style.color = '';
-        current.style.removeProperty('--word-progress');
-        setLineText(ghost, '');
-        ghost.style.opacity = '';
-        ghost.style.transform = '';
-        ghost.style.lineHeight = '';
-        ghost.style.height = '';
-        ghost.style.fontWeight = '';
-        ghost.style.color = '';
-        ghost.style.removeProperty('--word-progress');
-        pendingTexts.delete(current);
-        animationTimers.delete(current);
-        animationTokens.delete(current);
-        updateMarquee(current);
-      };
-      const settleTimer = window.setTimeout(settle, duration + 60);
-      Promise.allSettled([outAnimation.finished, inAnimation.finished]).then(settle);
-      animationTimers.set(current, { outAnimation, inAnimation, settleTimer });
-    };
-    const clearPairAnimation = () => {
-      if (!pairPending) return;
-      if (pairPending.settleTimer) window.clearTimeout(pairPending.settleTimer);
-      pairPending.animations.forEach((animation) => animation.cancel());
-      [lyricCurrent, translationCurrent, translationGhost].forEach((node) => {
-        clearMarquee(node);
-        node.style.opacity = '';
-        node.style.transform = '';
-        node.style.transformOrigin = '';
-        node.style.fontSize = '';
-        node.style.lineHeight = '';
-        node.style.height = '';
-        node.style.fontWeight = '';
-        node.style.color = '';
-        node.style.removeProperty('--word-progress');
-      });
-      setLineText(promotedLine, '');
-      clearMarquee(promotedLine);
-      promotedLine.classList.remove('word');
-      promotedLine.style.cssText = '';
-      translationCurrent.classList.remove('word');
-      setLineText(translationGhost, '');
-      translation.classList.remove('promoting');
-      pairPending = null;
-    };
-    const setDesktopLines = (primary, second, options) => {
-      const animated = Boolean(options?.animated);
-      const queueOriginals = Boolean(options?.queueOriginals);
-      const wordByWord = Boolean(options?.wordByWord);
-      const wordProgress = Math.max(0, Math.min(100, Number(options?.wordProgress || 0))) + '%';
-      const nextPrimary = primary || '...';
-      const nextSecond = second || '';
-      if (pairPending?.primary === nextPrimary) {
-        if (pairPending.second !== nextSecond) {
-          pairPending.second = nextSecond;
-          setLineText(translationGhost, nextSecond);
-        }
-        promotedLine.classList.toggle('word', wordByWord);
-        if (wordByWord) promotedLine.style.setProperty('--word-progress', wordProgress);
-        else promotedLine.style.removeProperty('--word-progress');
-        pairPending.wordByWord = wordByWord;
-        pairPending.wordProgress = wordProgress;
-        return;
-      }
-      const canPromoteSecond = false;
-      if (!canPromoteSecond) {
-        clearPairAnimation();
-        setText(lyricCurrent, lyricGhost, nextPrimary, animated);
-        setText(translationCurrent, translationGhost, nextSecond, animated);
-        lastPrimaryText = nextPrimary;
-        lastSecondText = nextSecond;
-        return;
-      }
-      clearAnimation(lyricCurrent, lyricGhost);
-      clearAnimation(translationCurrent, translationGhost);
-      clearPairAnimation();
-      const lyricRect = lyricCurrent.getBoundingClientRect();
-      const secondRect = translationCurrent.getBoundingClientRect();
-      const panelRect = panel.getBoundingClientRect();
-      const primaryStyle = getComputedStyle(lyricCurrent);
-      const secondStyle = getComputedStyle(translationCurrent);
-      const mainSlide = Math.max(20, Math.min(44, lyricRect.height * 0.64));
-      const secondSlide = Math.max(16, Math.min(36, secondRect.height * 0.72));
-      const primaryFontSize = Number.parseFloat(primaryStyle.fontSize) || 30;
-      const secondFontSize = Number.parseFloat(secondStyle.fontSize) || primaryFontSize;
-      const promoteStartScale = Math.max(0.5, Math.min(1, secondFontSize / primaryFontSize));
-      const promoteStart = {
-        left: secondRect.left - panelRect.left,
-        top: secondRect.top - panelRect.top,
-        width: secondRect.width,
-        height: secondRect.height
-      };
-      const promoteEnd = {
-        left: lyricRect.left - panelRect.left,
-        top: lyricRect.top - panelRect.top,
-        width: lyricRect.width,
-        height: lyricRect.height
-      };
-      const promoteBoxHeight = Math.max(promoteStart.height, promoteEnd.height) + 10;
-      const duration = 440;
-      const timing = { duration, easing: 'cubic-bezier(.2,1,.32,1)', fill: 'forwards' };
-      translation.classList.add('promoting');
-      setLineText(translationGhost, nextSecond);
-      lyricCurrent.style.opacity = '1';
-      lyricCurrent.style.transform = 'translate3d(0,0,0)';
-      const oldMainHadWord = lyricCurrent.classList.contains('word');
-      if (oldMainHadWord) {
-        lyricCurrent.classList.remove('word');
-        lyricCurrent.style.color = getComputedStyle(panel).getPropertyValue('--played-color').trim() || '#00b7c3';
-      }
-      translationCurrent.style.opacity = '0';
-      setLineText(promotedLine, nextPrimary);
-      promotedLine.style.left = promoteStart.left + 'px';
-      promotedLine.style.top = promoteStart.top + 'px';
-      promotedLine.style.width = promoteStart.width + 'px';
-      promotedLine.style.height = promoteBoxHeight + 'px';
-      promotedLine.style.fontSize = primaryStyle.fontSize;
-      promotedLine.style.lineHeight = primaryStyle.lineHeight;
-      promotedLine.style.fontWeight = primaryStyle.fontWeight;
-      promotedLine.style.color = wordByWord ? secondStyle.color : primaryStyle.color;
-      promotedLine.style.opacity = '1';
-      promotedLine.style.transformOrigin = 'center top';
-      promotedLine.style.transform = 'scale(' + promoteStartScale + ')';
-      translationGhost.style.opacity = '0';
-      translationGhost.style.transform = 'translate3d(0,' + secondSlide + 'px,0)';
-      if (wordByWord) {
-        lyricCurrent.style.setProperty('--word-progress', '100%');
-        promotedLine.classList.add('word');
-        promotedLine.style.setProperty('--word-progress', wordProgress);
       } else {
-        promotedLine.classList.remove('word');
-        promotedLine.style.removeProperty('--word-progress');
+        entry.scroll.textContent = next;
       }
-      void translationGhost.offsetWidth;
-      const oldMain = lyricCurrent.animate([
-        { opacity: 1, transform: 'translate3d(0,0,0)' },
-        { opacity: 0, transform: 'translate3d(0,-' + mainSlide + 'px,0)' }
-      ], timing);
-      const promoted = promotedLine.animate([
-        {
-          opacity: 1,
-          left: promoteStart.left + 'px',
-          top: promoteStart.top + 'px',
-          width: promoteStart.width + 'px',
-          height: promoteBoxHeight + 'px',
-          color: wordByWord ? secondStyle.color : primaryStyle.color,
-          transform: 'scale(' + promoteStartScale + ')'
-        },
-        {
-          opacity: 1,
-          left: promoteEnd.left + 'px',
-          top: promoteEnd.top + 'px',
-          width: promoteEnd.width + 'px',
-          height: promoteBoxHeight + 'px',
-          color: wordByWord ? secondStyle.color : primaryStyle.color,
-          transform: 'scale(1)'
-        }
-      ], timing);
-      const incomingSecond = translationGhost.animate([
-        { opacity: 0, transform: 'translate3d(0,' + secondSlide + 'px,0)' },
-        { opacity: 1, transform: 'translate3d(0,0,0)' }
-      ], timing);
-      const settle = () => {
-        if (pairPending?.primary !== nextPrimary) return;
-        const finalSecond = pairPending.second;
-        setLineText(lyricCurrent, nextPrimary);
-        setLineText(translationCurrent, finalSecond);
-        setLineText(translationGhost, '');
-        lyricCurrent.style.opacity = '1';
-        lyricCurrent.style.transform = 'translate3d(0,0,0)';
-        translationCurrent.style.opacity = '1';
-        translationCurrent.style.transform = 'translate3d(0,0,0)';
-        translationGhost.style.opacity = '0';
-        translationGhost.style.transform = 'translate3d(0,0,0)';
-        oldMain.cancel();
-        promoted.cancel();
-        incomingSecond.cancel();
-        [lyricCurrent, translationCurrent, translationGhost].forEach((node) => {
-          node.style.opacity = '';
-          node.style.transform = '';
-          node.style.transformOrigin = '';
-          node.style.fontSize = '';
-          node.style.lineHeight = '';
-          node.style.height = '';
-          node.style.fontWeight = '';
-          node.style.color = '';
-          node.style.removeProperty('--word-progress');
-        });
-        const finalWordByWord = Boolean(pairPending?.wordByWord);
-        const finalWordProgress = pairPending?.wordProgress || wordProgress;
-        lyricCurrent.classList.toggle('word', finalWordByWord);
-        if (finalWordByWord) lyricCurrent.style.setProperty('--word-progress', finalWordProgress);
-        setLineText(promotedLine, '');
-        promotedLine.classList.remove('word');
-        promotedLine.style.cssText = '';
-        translationCurrent.classList.remove('word');
-        translation.classList.remove('promoting');
-        pairPending = null;
-        lastPrimaryText = nextPrimary;
-        lastSecondText = finalSecond;
-        updateMarquee(lyricCurrent);
-        updateMarquee(translationCurrent);
-      };
-      const settleTimer = window.setTimeout(settle, duration + 70);
-      pairPending = { primary: nextPrimary, second: nextSecond, animations: [oldMain, promoted, incomingSecond], settleTimer, oldMainHadWord, wordByWord, wordProgress };
-      Promise.allSettled([oldMain.finished, promoted.finished, incomingSecond.finished]).then(settle);
     };
+    const createEntry = (spec, animated) => {
+      const line = document.createElement('div');
+      line.className = 'desktop-line entering';
+      if (!animated) line.classList.add('no-animation');
+      const scroll = document.createElement('span');
+      scroll.className = 'line-scroll';
+      line.appendChild(scroll);
+      lyricsViewport.appendChild(line);
+      const entry = { line, scroll, text: '', signature: '', leavingTimer: 0, spec };
+      lyricEntries.set(spec.key, entry);
+      setScrollContent(entry, spec);
+      applyLineSpec(entry, spec, true);
+      requestAnimationFrame(() => {
+        line.classList.remove('entering');
+        line.classList.remove('no-animation');
+      });
+      return entry;
+    };
+    const removeEntry = (key, animated) => {
+      const entry = lyricEntries.get(key);
+      if (!entry) return;
+      lyricEntries.delete(key);
+      if (entry.leavingTimer) window.clearTimeout(entry.leavingTimer);
+      if (!animated) {
+        entry.line.remove();
+        return;
+      }
+      entry.line.classList.add('leaving');
+      entry.leavingTimer = window.setTimeout(() => entry.line.remove(), 520);
+    };
+    const applyLineSpec = (entry, spec, immediate = false) => {
+      entry.spec = spec;
+      setScrollContent(entry, spec);
+      entry.line.classList.toggle('secondary', spec.index > 0);
+      entry.line.classList.toggle('no-animation', Boolean(immediate || !spec.animated));
+      entry.line.style.top = lineTop(spec.index) + 'px';
+      entry.line.style.height = lineHeight(spec.index) + 'px';
+      entry.line.style.color = spec.active ? 'var(--played-color, #00b7c3)' : 'var(--pending-color, #ccc)';
+      entry.scroll.classList.toggle('word', Boolean(spec.wordByWord && spec.active));
+      if (immediate || !spec.animated) {
+        requestAnimationFrame(() => entry.line.classList.remove('no-animation'));
+      }
+    };
+    const renderDesktopLines = (data) => {
+      const animated = Boolean(data.switchAnimation);
+      const primaryText = data.lyric || '...';
+      const wantsTranslation = Boolean(data.showTranslation && data.translation);
+      const secondText = data.doubleLine ? (wantsTranslation ? data.translation : (data.nextLyric || '')) : '';
+      const primaryStart = Number(data.lineStart);
+      const primaryEnd = Number(data.lineEnd);
+      const nextStart = Number(data.nextLineStart);
+      const nextEnd = Number(data.nextLineEnd);
+      const primaryKey = data.lineKey || makeLineKey('main', primaryText, primaryStart);
+      const lines = [{
+        key: primaryKey,
+        text: primaryText,
+        index: 0,
+        active: true,
+        animated,
+        start: Number.isFinite(primaryStart) ? primaryStart : undefined,
+        end: Number.isFinite(primaryEnd) ? primaryEnd : undefined,
+        wordByWord: Boolean(data.wordByWord),
+        wordLiftEffect: Boolean(data.wordLiftEffect),
+        wordScaleEffect: Boolean(data.wordScaleEffect),
+        words: Array.isArray(data.words) ? data.words : []
+      }];
+      if (secondText) {
+        lines.push({
+          key: wantsTranslation ? primaryKey + ':translation' : (data.nextLineKey || makeLineKey('main', secondText, nextStart)),
+          text: secondText,
+          index: 1,
+          active: false,
+          animated,
+          start: wantsTranslation ? (Number.isFinite(primaryStart) ? primaryStart : undefined) : (Number.isFinite(nextStart) ? nextStart : undefined),
+          end: wantsTranslation ? (Number.isFinite(primaryEnd) ? primaryEnd : undefined) : (Number.isFinite(nextEnd) ? nextEnd : undefined),
+          wordByWord: false,
+          wordLiftEffect: false,
+          wordScaleEffect: false,
+          words: []
+        });
+      }
+      lyricsViewport.classList.toggle('single', lines.length < 2);
+      latestLineSpecs = lines;
+      const nextKeys = new Set(lines.map((line) => line.key));
+      Array.from(lyricEntries.keys()).forEach((key) => {
+        if (!nextKeys.has(key)) removeEntry(key, animated);
+      });
+      lines.forEach((spec) => {
+        const entry = lyricEntries.get(spec.key) || createEntry(spec, animated);
+        applyLineSpec(entry, spec);
+      });
+      updateLineScrolls();
+    };
+    const updateLineScrolls = () => {
+      const seek = getSeek();
+      latestLineSpecs.forEach((spec) => {
+        const entry = lyricEntries.get(spec.key);
+        if (!entry) return;
+        if (spec.wordByWord && spec.active && Array.isArray(spec.words)) {
+          entry.scroll.querySelectorAll('.line-word').forEach((node, index) => {
+            paintWordNode(node, spec.words[index], spec);
+          });
+        }
+        const rawOverflow = entry.scroll.scrollWidth - entry.line.clientWidth;
+        const overflow = rawOverflow > 8 ? rawOverflow + 16 : 0;
+        if (overflow <= 8 || !Number.isFinite(Number(spec.start)) || !Number.isFinite(Number(spec.end)) || Number(spec.end) <= Number(spec.start)) {
+          entry.scroll.style.transform = 'translate3d(0,0,0)';
+          return;
+        }
+        const end = Math.max(Number(spec.start) + 0.1, Number(spec.end) - 0.8);
+        const progress = clamp((seek - Number(spec.start)) / Math.max(0.1, end - Number(spec.start)), 0, 1);
+        const scrollStart = 0.3;
+        if (progress <= scrollStart) {
+          entry.scroll.style.transform = 'translate3d(0,0,0)';
+          return;
+        }
+        const ratio = (progress - scrollStart) / (1 - scrollStart);
+        entry.scroll.style.transform = 'translate3d(-' + Math.round(overflow * ratio) + 'px,0,0)';
+      });
+    };
+    const tickLineScrolls = () => {
+      updateLineScrolls();
+      scrollFrame = window.requestAnimationFrame(tickLineScrolls);
+    };
+    scrollFrame = window.requestAnimationFrame(tickLineScrolls);
     const desktopIcons = {
       play: '<svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5z"></path></svg>',
       pause: '<svg viewBox="0 0 24 24"><path d="M8 5v14"></path><path d="M16 5v14"></path></svg>',
@@ -1252,7 +1252,10 @@ function createDesktopLyricWindow() {
     window.electronAPI.desktopLyrics.onData((data) => {
       data = data || {};
       if (Object.prototype.hasOwnProperty.call(data, 'locked')) {
-        panel.classList.toggle('locked', Boolean(data.locked));
+        const wasLocked = locked;
+        locked = Boolean(data.locked);
+        if (wasLocked !== locked) hideChrome();
+        panel.classList.toggle('locked', locked);
         document.getElementById('lock').innerHTML = data.locked ? desktopIcons.locked : desktopIcons.unlocked;
       }
       const lockOnlyUpdate = Object.keys(data || {}).every((key) => key === 'locked');
@@ -1268,24 +1271,8 @@ function createDesktopLyricWindow() {
       panel.style.setProperty('--played-color', data.playedColor || '#00b7c3');
       panel.style.setProperty('--pending-color', data.pendingColor || '#ccc');
       panel.style.setProperty('--stroke-color', data.strokeColor || 'rgba(0,0,0,.69)');
-      const desktopWordProgress = Math.max(0, Math.min(100, Number(data.wordProgress || 0))) + '%';
-      const lyricMarqueeing = lyricCurrent.dataset.marquee === 'true';
-      const shouldUseWordByWord = Boolean(data.wordByWord) && !lyricMarqueeing;
-      if (!pairPending) {
-        lyricCurrent.classList.toggle('word', shouldUseWordByWord);
-        lyricGhost.classList.toggle('word', shouldUseWordByWord);
-      }
-      if (shouldUseWordByWord) lyric.style.setProperty('--word-progress', desktopWordProgress);
-      else lyric.style.removeProperty('--word-progress');
-      const wantsTranslation = Boolean(data.showTranslation && data.translation);
-      const secondLine = data.doubleLine ? (wantsTranslation ? data.translation : (data.nextLyric || '')) : '';
-      setDesktopLines(data.lyric || '...', secondLine, {
-        animated: Boolean(data.switchAnimation),
-        queueOriginals: Boolean(data.doubleLine && !wantsTranslation),
-        wordByWord: shouldUseWordByWord,
-        wordProgress: data.wordProgress
-      });
-      translation.classList.toggle('empty', !secondLine);
+      syncSeek(data);
+      renderDesktopLines(data);
       document.getElementById('play').innerHTML = data.isPlaying ? desktopIcons.pause : desktopIcons.play;
     });
   </script>
@@ -1295,7 +1282,12 @@ function createDesktopLyricWindow() {
   desktopLyricWindow.webContents.once("did-finish-load", () => {
     applyDesktopLyricLock(desktopLyricLockedState, true);
   });
+  desktopLyricWindow.on("close", () => {
+    captureDesktopLyricBounds();
+  });
   desktopLyricWindow.on("closed", () => {
+    desktopLyricDragState = null;
+    desktopLyricControlsInteractive = false;
     desktopLyricWindow = null;
     sendPlayerCommand("desktop-closed");
   });
@@ -1357,10 +1349,80 @@ ipcMain.handle("library:import-paths", async (_, paths) => {
   return { canceled: false, tracks };
 });
 
-ipcMain.handle("desktop-lyrics:set-open", (_, open) => {
+function getDesktopLyricDragPoint(point) {
+  const screenX = Number(point?.screenX);
+  const screenY = Number(point?.screenY);
+  if (!Number.isFinite(screenX) || !Number.isFinite(screenY)) return null;
+  return { screenX, screenY };
+}
+
+function restoreDesktopLyricDragSize() {
+  if (!desktopLyricWindow || desktopLyricWindow.isDestroyed()) return;
+  desktopLyricWindow.setMaximumSize(10000, 10000);
+}
+
+function isDesktopLyricSender(event) {
+  return desktopLyricWindow
+    && !desktopLyricWindow.isDestroyed()
+    && BrowserWindow.fromWebContents(event.sender) === desktopLyricWindow;
+}
+
+ipcMain.on("desktop-lyrics:drag-start", (event, point) => {
+  if (desktopLyricLockedState || !isDesktopLyricSender(event)) return;
+  const dragPoint = getDesktopLyricDragPoint(point);
+  if (!dragPoint) return;
+  const bounds = desktopLyricWindow.getBounds();
+  const width = Math.max(1, Math.round(bounds.width));
+  const height = Math.max(1, Math.round(bounds.height));
+  desktopLyricWindow.setMaximumSize(width, height);
+  desktopLyricDragState = {
+    ...dragPoint,
+    windowX: bounds.x,
+    windowY: bounds.y,
+    width,
+    height
+  };
+});
+
+ipcMain.on("desktop-lyrics:drag-move", (event, point) => {
+  if (desktopLyricLockedState || !desktopLyricDragState || !isDesktopLyricSender(event)) return;
+  const dragPoint = getDesktopLyricDragPoint(point);
+  if (!dragPoint) return;
+  const nextX = Math.round(desktopLyricDragState.windowX + dragPoint.screenX - desktopLyricDragState.screenX);
+  const nextY = Math.round(desktopLyricDragState.windowY + dragPoint.screenY - desktopLyricDragState.screenY);
+  desktopLyricWindow.setBounds({
+    x: nextX,
+    y: nextY,
+    width: desktopLyricDragState.width,
+    height: desktopLyricDragState.height
+  }, false);
+  rememberDesktopLyricBounds({
+    x: nextX,
+    y: nextY,
+    width: desktopLyricDragState.width,
+    height: desktopLyricDragState.height
+  });
+});
+
+ipcMain.on("desktop-lyrics:drag-end", (event) => {
+  if (!isDesktopLyricSender(event)) return;
+  restoreDesktopLyricDragSize();
+  captureDesktopLyricBounds();
+  desktopLyricDragState = null;
+});
+
+ipcMain.on("desktop-lyrics:controls-hover", (event, active) => {
+  if (!isDesktopLyricSender(event)) return;
+  desktopLyricControlsInteractive = Boolean(active);
+  applyDesktopLyricMouseEvents();
+});
+
+ipcMain.handle("desktop-lyrics:set-open", async (_, open) => {
   if (open) {
+    await loadDesktopLyricBounds();
     createDesktopLyricWindow().show();
   } else if (desktopLyricWindow && !desktopLyricWindow.isDestroyed()) {
+    captureDesktopLyricBounds();
     desktopLyricWindow.close();
   }
 });

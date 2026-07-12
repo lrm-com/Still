@@ -5,6 +5,7 @@ release/
 .codex/
 .agents/
 .codex-video-frames/
+.codex-video-frames-*/
 .codex-*.log
 
 *.local

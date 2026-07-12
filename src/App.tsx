@@ -23,9 +23,10 @@ type View =
 type LyricMode = "lyrics" | "cover" | "mix-horizontal" | "mix-vertical";
 type LyricPosition = "left" | "center" | "right";
 type LyricWordAnimation = "off" | "auto";
-type SortKey = "title" | "artist" | "album" | "year" | "duration" | "folder" | "filePath";
+type SortKey = "title" | "artist" | "album" | "year" | "duration" | "folder" | "fileName" | "modifiedAt" | "fileSize";
 type PlayMode = "sequential" | "list-loop" | "single-loop" | "shuffle";
 type AccentMode = "manual" | "cover";
+type ThemeMode = "dark" | "light" | "system";
 
 type LyricWord = { time: number; text: string; endTime?: number };
 type LyricLine = { time: number; text: string; translation?: string; words?: LyricWord[] };
@@ -117,11 +118,11 @@ type PersistedAppState = {
   playlists?: Playlist[];
   currentTrackId?: string;
   playQueueIds?: string[];
-  theme?: "dark" | "light";
+  theme?: ThemeMode;
   volume?: number;
   playbackRate?: number;
   playMode?: PlayMode;
-  sortKey?: SortKey;
+  sortKey?: SortKey | "filePath";
   sortDirection?: "asc" | "desc";
   accentColor?: string;
   accentMode?: AccentMode;
@@ -364,6 +365,19 @@ function LineIcon({ children, className = "h-5 w-5" }: { children: ReactNode; cl
     >
       {children}
     </svg>
+  );
+}
+
+function PageTitle({ title, count, className = "" }: { title: ReactNode; count?: number | string; className?: string }) {
+  return (
+    <div className={`flex min-w-0 items-baseline gap-4 ${className}`}>
+      <h1 className="min-w-0 truncate text-[36px] font-black leading-none tracking-normal sm:text-[42px]">{title}</h1>
+      {count !== undefined && count !== "" && (
+        <span className="shrink-0 text-[24px] font-semibold leading-none tracking-normal text-[var(--dim)] sm:text-[28px]">
+          {count}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -1113,6 +1127,14 @@ function formatBytes(bytes?: number) {
   return `${mb.toFixed(2)} MB (${bytes.toLocaleString()} B; ${mib.toFixed(2)} MiB)`;
 }
 
+function formatBytesShort(bytes?: number) {
+  if (!bytes || !Number.isFinite(bytes)) return "-";
+  if (bytes >= 1_000_000_000) return `${(bytes / 1_000_000_000).toFixed(2)} GB`;
+  if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(2)} MB`;
+  if (bytes >= 1_000) return `${(bytes / 1_000).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
 function formatDateTime(timestamp?: number) {
   if (!timestamp || !Number.isFinite(timestamp)) return "-";
   return new Intl.DateTimeFormat("zh-CN", {
@@ -1122,6 +1144,15 @@ function formatDateTime(timestamp?: number) {
     hour: "2-digit",
     minute: "2-digit"
   }).format(new Date(timestamp));
+}
+
+function formatDateOnly(timestamp?: number) {
+  if (!timestamp || !Number.isFinite(timestamp)) return "-";
+  const date = new Date(timestamp);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function formatBitrate(value?: number) {
@@ -1153,6 +1184,12 @@ function getExt(name: string) {
 function getBaseName(name: string) {
   const ext = getExt(name);
   return ext ? name.slice(0, -ext.length) : name;
+}
+
+function getFileNameBase(filePath: string) {
+  const normalized = filePath.replace(/\\/g, "/");
+  const fileName = normalized.split("/").filter(Boolean).pop() || filePath;
+  return getBaseName(fileName);
 }
 
 function getPinyinInitial(text: string) {
@@ -1266,12 +1303,25 @@ function getTrackAlphaText(track: Track, sortKey: SortKey) {
   if (sortKey === "artist") return track.artist || track.title;
   if (sortKey === "album") return track.album || track.title;
   if (sortKey === "folder") return track.folder || track.title;
-  if (sortKey === "filePath") return getBaseName(track.filePath || track.title);
+  if (sortKey === "fileName") return getFileNameBase(track.localPath || track.filePath || track.title);
   return track.title;
 }
 
 function getTrackAlphaLetter(track: Track, sortKey: SortKey) {
   return getPinyinInitial(getTrackAlphaText(track, sortKey));
+}
+
+function getTrackSectionLabel(track: Track, sortKey: SortKey) {
+  if (sortKey === "year") return track.year ? String(track.year) : "-";
+  if (sortKey === "duration" || sortKey === "modifiedAt" || sortKey === "fileSize") return null;
+  return getTrackAlphaLetter(track, sortKey);
+}
+
+function getTrackBubbleLabel(track: Track, sortKey: SortKey) {
+  if (sortKey === "duration") return toTimeText(track.duration);
+  if (sortKey === "modifiedAt") return formatDateOnly(track.modifiedAt);
+  if (sortKey === "fileSize") return formatBytesShort(track.fileSize);
+  return getTrackSectionLabel(track, sortKey) || "#";
 }
 
 function compareTrackAlphaText(a: Track, b: Track, sortKey: SortKey) {
@@ -1305,6 +1355,45 @@ function getFolderPathFromTrackPath(relativePath: string, localPath?: string) {
   const relativeSlash = relative.lastIndexOf("/");
   if (relativeSlash > 0) return relative.slice(0, relativeSlash);
   return "Imported";
+}
+
+function formatLrcTimestampMs(timestamp: number) {
+  const totalMs = Math.max(0, Math.round(Number(timestamp) || 0));
+  const minutes = Math.floor(totalMs / 60000);
+  const seconds = Math.floor((totalMs % 60000) / 1000);
+  const milliseconds = totalMs % 1000;
+  return `[${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(milliseconds).padStart(3, "0")}]`;
+}
+
+function metadataSyncTextToLrc(syncText: unknown) {
+  if (!Array.isArray(syncText)) return "";
+  return syncText
+    .map((item) => {
+      if (!item || typeof item !== "object") return "";
+      const entry = item as { timestamp?: unknown; text?: unknown; lyrics?: unknown; value?: unknown; description?: unknown };
+      const timestamp = Number(entry.timestamp);
+      const text = normalizeMetadataLyricText(entry.text ?? entry.lyrics ?? entry.value ?? entry.description);
+      if (!Number.isFinite(timestamp) || !text) return "";
+      return `${formatLrcTimestampMs(timestamp)}${text}`;
+    })
+    .filter(Boolean)
+    .join("\n")
+    .trim();
+}
+
+function normalizeMetadataLyricText(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "number") return String(value);
+  if (Array.isArray(value)) return value.map((item) => normalizeMetadataLyricText(item)).filter(Boolean).join("\n").trim();
+  if (value && typeof value === "object") {
+    const item = value as { syncText?: unknown; text?: unknown; lyrics?: unknown; value?: unknown; description?: unknown };
+    const synced = metadataSyncTextToLrc(item.syncText);
+    if (synced) return synced;
+    const direct = normalizeMetadataLyricText(item.text ?? item.lyrics ?? item.value ?? item.description);
+    if (direct) return direct;
+    return Object.values(value).map((entry) => normalizeMetadataLyricText(entry)).filter(Boolean).join("\n").trim();
+  }
+  return "";
 }
 
 function parseLrc(raw: string) {
@@ -1423,11 +1512,21 @@ function containsCjk(text: string) {
   return /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(text);
 }
 
+function containsKana(text: string) {
+  return /[\u3040-\u30ff]/.test(text);
+}
+
+function containsHan(text: string) {
+  return /[\u3400-\u9fff]/.test(text);
+}
+
 function looksLikeTranslation(candidate: string, original = "") {
   if (!candidate.trim()) return false;
   if (!original.trim()) return false;
   if (containsCjk(candidate) && !containsCjk(original)) return true;
   if (!containsCjk(candidate) && containsCjk(original)) return true;
+  if (containsKana(original) && containsHan(candidate) && !containsKana(candidate)) return true;
+  if (containsKana(candidate) && containsHan(original) && !containsKana(original)) return true;
   return false;
 }
 
@@ -1438,17 +1537,41 @@ function appendLyricTranslation(current: string | undefined, next: string) {
   return parts.includes(value) ? current : [...parts, value].join("\n");
 }
 
+const TRANSLATION_LABEL_REGEX = /^(?:翻译|譯文|译文|中文|中译|中譯|简体中文|繁體中文|translation|translated|trans)\s*[:：]?\s*/i;
+const TRAILING_TRANSLATION_REGEX = /^(.*?)\s*[\(\uFF08]\s*((?:翻译|譯文|译文|中文|中译|中譯|简体中文|繁體中文|translation|translated|trans)\s*[:：]?\s*.+?)\s*[\)\uFF09]\s*$/i;
+const INLINE_TRANSLATION_REGEX = /^(.*?)\s+(翻译|譯文|译文|translation|translated|trans)\s*[:：]\s*(.+)$/i;
+
+function stripTranslationLabel(value: string) {
+  return value.replace(TRANSLATION_LABEL_REGEX, "").trim();
+}
+
 function splitLyricText(content: string): [string, string | undefined] {
+  const trimmed = content.trim();
+  const taggedTrailing = trimmed.match(TRAILING_TRANSLATION_REGEX);
+  if (taggedTrailing) {
+    const main = taggedTrailing[1].trim();
+    const translation = stripTranslationLabel(taggedTrailing[2]);
+    if (main && translation) return [main, translation];
+    if (translation) return [translation, undefined];
+  }
+
+  const inlineTagged = trimmed.match(INLINE_TRANSLATION_REGEX);
+  if (inlineTagged) {
+    const main = inlineTagged[1].trim();
+    const translation = inlineTagged[3].trim();
+    if (main && translation) return [main, translation];
+  }
+
   const separators = [/\s*\|\|\s*/, /\s*\|\s*/, /\s* \/ \s*/, /\s*／\s*/, /\s*｜\s*/];
   for (const separator of separators) {
-    const parts = content.split(separator).map((part) => part.trim()).filter(Boolean);
+    const parts = trimmed.split(separator).map((part) => part.trim()).filter(Boolean);
     if (parts.length >= 2) return [parts[0], parts.slice(1).join("\n")];
   }
-  const slashParts = content.split(/\s{2,}/).map((part) => part.trim()).filter(Boolean);
+  const slashParts = trimmed.split(/\s{2,}/).map((part) => part.trim()).filter(Boolean);
   if (slashParts.length >= 2 && looksLikeTranslation(slashParts[1], slashParts[0])) {
     return [slashParts[0], slashParts.slice(1).join("\n")];
   }
-  return [content, undefined];
+  return [trimmed, undefined];
 }
 
 function mergeAdjacentPlainTranslations(lines: string[]) {
@@ -1471,10 +1594,21 @@ function normalizeLyricLines(lines: LyricLine[]) {
   while (index < lines.length) {
     const line = lines[index];
     const text = line.text.trim();
+    const [mainText, inlineTranslation] = splitLyricText(text);
+    const normalizedText = mainText.trim();
     index += 1;
-    if (!text) continue;
+    if (!normalizedText) continue;
 
-    const group = [{ ...line, text }];
+    const normalizedLine = { ...line, text: normalizedText };
+    if (inlineTranslation) {
+      normalizedLine.translation = appendLyricTranslation(normalizedLine.translation, inlineTranslation);
+      if (normalizedLine.words?.length) {
+        const words = trimEnhancedWordsToText(normalizedLine.words, normalizedText);
+        normalizedLine.words = words.length ? words : undefined;
+      }
+    }
+
+    const group = [normalizedLine];
     while (index < lines.length) {
       const next = lines[index];
       const nextText = next.text.trim();
@@ -1869,11 +2003,7 @@ async function readTags(file: File, localPath?: string) {
 
     const common = metadata.common;
     const native = metadata.native;
-    const embeddedLyrics = Array.isArray(common.lyrics)
-      ? common.lyrics.filter(Boolean).join("\n")
-      : typeof common.lyrics === "string"
-        ? common.lyrics
-        : "";
+    const embeddedLyrics = normalizeMetadataLyricText(common.lyrics);
 
     const nativeAlbum = pickNativeTag(native, ["ALBUM", "TALB"]);
     const nativeYear = pickNativeTag(native, ["DATE", "YEAR", "TYER", "TDRC"]);
@@ -1950,7 +2080,11 @@ export default function App() {
   const scrollbarDraggingRef = useRef(false);
   const customScrollbarDraggingRef = useRef(false);
 
-  const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [themePreference, setTheme] = useState<ThemeMode>("system");
+  const [systemTheme, setSystemTheme] = useState<"dark" | "light">(() => (
+    typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark"
+  ));
+  const theme = themePreference === "system" ? systemTheme : themePreference;
   const [view, setView] = useState<View>("songs");
   const [tracks, setTracks] = useState<Track[]>(DEMO_TRACKS);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
@@ -2088,6 +2222,15 @@ export default function App() {
         : track.cover
     }));
 
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const syncSystemTheme = () => setSystemTheme(media.matches ? "dark" : "light");
+    syncSystemTheme();
+    media.addEventListener?.("change", syncSystemTheme);
+    return () => media.removeEventListener?.("change", syncSystemTheme);
+  }, []);
+
   const restoreState = (state: PersistedAppState | null) => {
     if (!state) return;
     const restoredTracks = (state.tracks || []).map((track) => ({
@@ -2108,7 +2251,7 @@ export default function App() {
     if (typeof state.volume === "number") setVolume(state.volume);
     if (typeof state.playbackRate === "number") setPlaybackRate(Math.max(0.1, Math.min(3, state.playbackRate)));
     if (state.playMode) setPlayMode(state.playMode);
-    if (state.sortKey) setSortKey(state.sortKey);
+    if (state.sortKey) setSortKey(state.sortKey === "filePath" ? "fileName" : state.sortKey);
     if (state.sortDirection) setSortDirection(state.sortDirection);
     if (state.accentColor) setAccentColor(normalizeAccentColor(state.accentColor));
     if (state.accentMode) setAccentMode(state.accentMode);
@@ -2191,7 +2334,7 @@ export default function App() {
         playlists: playlists.map((playlist) => ({ ...playlist, trackIds: playlist.trackIds.filter((id) => validIds.has(id)) })),
         currentTrackId: validIds.has(currentTrackId) ? currentTrackId : storedTracks[0]?.id || "",
         playQueueIds: playQueueIds.filter((id) => validIds.has(id)),
-        theme,
+        theme: themePreference,
         volume,
         playbackRate,
         playMode,
@@ -2233,7 +2376,7 @@ export default function App() {
     return () => {
       if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
     };
-  }, [tracks, playlists, currentTrackId, playQueueIds, theme, volume, playbackRate, playMode, sortKey, sortDirection, accentColor, accentMode, lyricsMode, translationEnabled, translationPreference, lyricAutoScale, lyricFontSize, lyricTranslationFontSize, lyricFontWeight, lyricPosition, lyricLeftOffset, lyricScrollPosition, lyricAutoBlur, lyricFadeEffect, lyricDistantView, lyricWordAnimation, desktopLyricOpen, desktopLyricLocked, desktopLyricDoubleLine, desktopLyricShowTranslation, desktopLyricWordByWord, desktopLyricSwitchAnimation, desktopLyricFontSize, desktopLyricSecondLineSize, desktopLyricFontWeight, desktopLyricPlayedColor, desktopLyricPendingColor, desktopLyricStrokeColor, selectedPlaylistId, warnOnMetaMissing, unreadableTrackIds]);
+  }, [tracks, playlists, currentTrackId, playQueueIds, themePreference, volume, playbackRate, playMode, sortKey, sortDirection, accentColor, accentMode, lyricsMode, translationEnabled, translationPreference, lyricAutoScale, lyricFontSize, lyricTranslationFontSize, lyricFontWeight, lyricPosition, lyricLeftOffset, lyricScrollPosition, lyricAutoBlur, lyricFadeEffect, lyricDistantView, lyricWordAnimation, desktopLyricOpen, desktopLyricLocked, desktopLyricDoubleLine, desktopLyricShowTranslation, desktopLyricWordByWord, desktopLyricSwitchAnimation, desktopLyricFontSize, desktopLyricSecondLineSize, desktopLyricFontWeight, desktopLyricPlayedColor, desktopLyricPendingColor, desktopLyricStrokeColor, selectedPlaylistId, warnOnMetaMissing, unreadableTrackIds]);
 
   useEffect(() => {
     const player = audioRef.current;
@@ -2594,7 +2737,9 @@ export default function App() {
       if (sortKey === "album") return (compareTrackAlphaText(a, b, "album") || a.trackNo - b.trackNo) * factor;
       if (sortKey === "year") return (a.year - b.year || a.trackNo - b.trackNo) * factor;
       if (sortKey === "folder") return compareTrackAlphaText(a, b, "folder") * factor;
-      if (sortKey === "filePath") return compareTrackAlphaText(a, b, "filePath") * factor;
+      if (sortKey === "fileName") return compareTrackAlphaText(a, b, "fileName") * factor;
+      if (sortKey === "modifiedAt") return (Math.floor((a.modifiedAt || 0) / 1000) - Math.floor((b.modifiedAt || 0) / 1000) || compareTrackAlphaText(a, b, "title")) * factor;
+      if (sortKey === "fileSize") return ((a.fileSize || 0) - (b.fileSize || 0) || compareTrackAlphaText(a, b, "title")) * factor;
       return (a.duration - b.duration) * factor;
     });
   };
@@ -2928,8 +3073,13 @@ export default function App() {
     [currentTrack, currentAlphaTracks]
   );
   const availableAlphaLetters = useMemo(() => {
-    const letters = new Set(currentAlphaTracks.map((track) => getTrackAlphaLetter(track, sortKey)));
-    return TRACK_ALPHA_LETTERS.filter((letter) => letters.has(letter));
+    const labels = new Set(currentAlphaTracks.map((track) => getTrackSectionLabel(track, sortKey)).filter((label): label is string => Boolean(label)));
+    return sortKey === "year"
+      ? currentAlphaTracks
+        .map((track) => getTrackSectionLabel(track, sortKey))
+        .filter((label): label is string => Boolean(label))
+        .filter((label, index, source) => source.indexOf(label) === index)
+      : TRACK_ALPHA_LETTERS.filter((letter) => labels.has(letter));
   }, [currentAlphaTracks, sortKey]);
   const trackInfo = useMemo(() => tracks.find((track) => track.id === trackInfoId) || null, [trackInfoId, tracks]);
   const trackInfoLyricSource = useMemo(
@@ -3187,7 +3337,7 @@ export default function App() {
   }, [mainScrollbar, updateMainScrollbar]);
 
   const showTrackAlphaBubble = useCallback((letter: string) => {
-    if (!availableAlphaLetters.length) return;
+    if (!currentAlphaTracks.length) return;
     const main = mainScrollRef.current;
     const rect = main?.getBoundingClientRect();
     const pointer = mainPointerRef.current;
@@ -3208,34 +3358,35 @@ export default function App() {
     trackAlphaBubbleTimerRef.current = window.setTimeout(() => {
       if (!scrollbarDraggingRef.current) setTrackAlphaBubble((prev) => ({ ...prev, visible: false }));
     }, 900);
-  }, [availableAlphaLetters.length]);
+  }, [currentAlphaTracks.length]);
 
   const getCurrentTrackAlphaLetter = useCallback(() => {
     const main = mainScrollRef.current;
-    if (!main) return availableAlphaLetters[0] || "#";
+    if (!main) return currentAlphaTracks[0] ? getTrackBubbleLabel(currentAlphaTracks[0], sortKey) : "#";
     const virtualList = document.getElementById(`track-virtual-list-${view}`);
     if (virtualList && currentAlphaTracks.length) {
       const mainRect = main.getBoundingClientRect();
       const listRect = virtualList.getBoundingClientRect();
       const probeTop = Math.max(0, mainRect.top - listRect.top + 90);
-      let active = availableAlphaLetters[0] || "#";
+      let activeTrack = currentAlphaTracks[0];
       let top = 0;
       let previousLetter = "";
       for (const track of currentAlphaTracks) {
-        const letter = getTrackAlphaLetter(track, sortKey);
-        if (letter !== previousLetter) {
+        const letter = getTrackSectionLabel(track, sortKey);
+        if (letter && letter !== previousLetter) {
           if (top > probeTop) break;
-          active = letter;
           previousLetter = letter;
           top += TRACK_ALPHA_HEIGHT;
         }
+        if (top > probeTop) break;
+        activeTrack = track;
         top += TRACK_ROW_HEIGHT;
       }
-      return active;
+      return getTrackBubbleLabel(activeTrack, sortKey);
     }
     const mainRect = main.getBoundingClientRect();
     const headers = [...main.querySelectorAll<HTMLElement>("[data-alpha-letter]")];
-    let active = headers[0]?.dataset.alphaLetter || availableAlphaLetters[0] || "#";
+    let active = headers[0]?.dataset.alphaLetter || (currentAlphaTracks[0] ? getTrackBubbleLabel(currentAlphaTracks[0], sortKey) : "#");
     for (const header of headers) {
       if (header.getBoundingClientRect().top <= mainRect.top + 90) {
         active = header.dataset.alphaLetter || active;
@@ -3244,29 +3395,29 @@ export default function App() {
       }
     }
     return active;
-  }, [availableAlphaLetters, currentAlphaTracks, sortKey, view]);
+  }, [currentAlphaTracks, sortKey, view]);
 
   const handleMainScroll = useCallback(() => {
     updateMainScrollbar();
-    if (!availableAlphaLetters.length || !scrollbarDraggingRef.current) return;
+    if (!currentAlphaTracks.length || !scrollbarDraggingRef.current) return;
     showTrackAlphaBubble(getCurrentTrackAlphaLetter());
-  }, [availableAlphaLetters.length, getCurrentTrackAlphaLetter, showTrackAlphaBubble, updateMainScrollbar]);
+  }, [currentAlphaTracks.length, getCurrentTrackAlphaLetter, showTrackAlphaBubble, updateMainScrollbar]);
 
   const handleMainPointerMove = useCallback((event: ReactPointerEvent<HTMLElement>) => {
     mainPointerRef.current = { x: event.clientX, y: event.clientY };
-    if (scrollbarDraggingRef.current && availableAlphaLetters.length) {
+    if (scrollbarDraggingRef.current && currentAlphaTracks.length) {
       showTrackAlphaBubble(getCurrentTrackAlphaLetter());
     }
-  }, [availableAlphaLetters.length, getCurrentTrackAlphaLetter, showTrackAlphaBubble]);
+  }, [currentAlphaTracks.length, getCurrentTrackAlphaLetter, showTrackAlphaBubble]);
 
   const handleMainPointerDown = useCallback((event: ReactPointerEvent<HTMLElement>) => {
     const rect = event.currentTarget.getBoundingClientRect();
     scrollbarDraggingRef.current = event.clientX >= rect.right - 20;
     mainPointerRef.current = { x: event.clientX, y: event.clientY };
-    if (scrollbarDraggingRef.current && availableAlphaLetters.length) {
+    if (scrollbarDraggingRef.current && currentAlphaTracks.length) {
       showTrackAlphaBubble(getCurrentTrackAlphaLetter());
     }
-  }, [availableAlphaLetters.length, getCurrentTrackAlphaLetter, showTrackAlphaBubble]);
+  }, [currentAlphaTracks.length, getCurrentTrackAlphaLetter, showTrackAlphaBubble]);
 
   const endScrollbarDrag = useCallback(() => {
     scrollbarDraggingRef.current = false;
@@ -3289,7 +3440,7 @@ export default function App() {
     const onPointerMove = (event: PointerEvent) => {
       mainPointerRef.current = { x: event.clientX, y: event.clientY };
       scrollMainFromScrollbarY(event.clientY);
-      if (availableAlphaLetters.length) showTrackAlphaBubble(getCurrentTrackAlphaLetter());
+      if (currentAlphaTracks.length) showTrackAlphaBubble(getCurrentTrackAlphaLetter());
     };
     const onPointerUp = () => endScrollbarDrag();
     window.addEventListener("pointermove", onPointerMove);
@@ -3298,7 +3449,7 @@ export default function App() {
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
     };
-  }, [availableAlphaLetters.length, customScrollbarDragging, endScrollbarDrag, getCurrentTrackAlphaLetter, scrollMainFromScrollbarY, showTrackAlphaBubble, mainScrollbar]);
+  }, [currentAlphaTracks.length, customScrollbarDragging, endScrollbarDrag, getCurrentTrackAlphaLetter, scrollMainFromScrollbarY, showTrackAlphaBubble, mainScrollbar]);
 
   const scrollToTrackAlphaLetter = useCallback((letter: string) => {
     setTrackAlphaPickerOpen(false);
@@ -3565,7 +3716,7 @@ export default function App() {
   useEffect(() => {
     const onPointerMove = (event: PointerEvent) => {
       mainPointerRef.current = { x: event.clientX, y: event.clientY };
-      if (scrollbarDraggingRef.current && availableAlphaLetters.length) {
+      if (scrollbarDraggingRef.current && currentAlphaTracks.length) {
         showTrackAlphaBubble(getCurrentTrackAlphaLetter());
       }
     };
@@ -3578,7 +3729,7 @@ export default function App() {
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
     };
-  }, [availableAlphaLetters.length, getCurrentTrackAlphaLetter, showTrackAlphaBubble]);
+  }, [currentAlphaTracks.length, getCurrentTrackAlphaLetter, showTrackAlphaBubble]);
 
   useEffect(() => {
     const onResize = () => {
@@ -3695,23 +3846,45 @@ export default function App() {
     if (!desktopLyricOpen) return;
     const activeLine = activeLyricIndex >= 0 ? currentLyrics[activeLyricIndex] : undefined;
     const nextLine = activeLyricIndex >= 0 ? currentLyrics[activeLyricIndex + 1] : undefined;
+    const nextNextLine = activeLyricIndex >= 0 ? currentLyrics[activeLyricIndex + 2] : undefined;
     const desktopWordByWord = desktopLyricWordByWord === "auto" && Boolean(activeLine?.words?.length);
     const desktopInfo = currentTrack || IDLE_TRACK_INFO;
     const wordProgress = desktopWordByWord && activeLine ? getLyricWordProgress(activeLine, activeLyricIndex) * 100 : 0;
     const cover = resolvedCurrentCover || currentTrack?.cover || "";
+    const lyricTime = currentTime + lyricTimeOffset;
+    const makeDesktopLineKey = (line?: LyricLine) => line ? `${Math.round(line.time * 1000)}:${line.text.slice(0, 48)}` : "";
+    const lineEnd = activeLine ? (nextLine?.time ?? currentTrack?.duration ?? activeLine.time + 5) : undefined;
+    const nextLineEnd = nextLine ? (nextNextLine?.time ?? currentTrack?.duration ?? nextLine.time + 5) : undefined;
+    const desktopSeekTick = Math.round(lyricTime * 5) / 5;
+    const desktopWords = desktopWordByWord && activeLine?.words?.length
+      ? activeLine.words.map((word, index) => ({
+        text: word.text,
+        time: word.time,
+        endTime: getLyricWordEndAt(currentLyrics, activeLyricIndex, index, currentTrack?.duration || 0)
+      }))
+      : [];
     const payloadKey = [
       currentTrack?.id || "idle",
       desktopInfo.title,
       desktopInfo.artist,
       desktopInfo.album,
       cover.length,
+      makeDesktopLineKey(activeLine),
+      makeDesktopLineKey(nextLine),
       activeLine?.text || "",
       activeLine?.translation || "",
       nextLine?.text || "",
+      activeLine?.time ?? "",
+      lineEnd ?? "",
+      nextLine?.time ?? "",
+      nextLineEnd ?? "",
       desktopLyricDoubleLine,
       desktopLyricShowTranslation,
       desktopWordByWord,
       desktopWordByWord ? Math.round(wordProgress * 10) / 10 : 0,
+      desktopWords.length,
+      desktopWords.map((word) => `${word.time}-${word.endTime}`).join(","),
+      desktopSeekTick,
       desktopLyricSwitchAnimation,
       desktopLyricFontSize,
       desktopLyricSecondLineSize,
@@ -3733,6 +3906,15 @@ export default function App() {
       lyric: currentTrack ? (activeLine?.text || "...") : IDLE_TRACK_INFO.title,
       translation: activeLine?.translation || "",
       nextLyric: nextLine?.text || "",
+      lineKey: makeDesktopLineKey(activeLine),
+      nextLineKey: makeDesktopLineKey(nextLine),
+      lineStart: activeLine?.time,
+      lineEnd,
+      nextLineStart: nextLine?.time,
+      nextLineEnd,
+      lyricTime,
+      sentAt: Date.now(),
+      words: desktopWords,
       doubleLine: desktopLyricDoubleLine,
       showTranslation: desktopLyricShowTranslation,
       wordByWord: desktopWordByWord,
@@ -3747,7 +3929,7 @@ export default function App() {
       locked: desktopLyricLocked,
       wordProgress
     });
-  }, [desktopLyricOpen, desktopLyricLocked, desktopLyricDoubleLine, desktopLyricShowTranslation, desktopLyricWordByWord, desktopLyricSwitchAnimation, desktopLyricFontSize, desktopLyricSecondLineSize, desktopLyricFontWeight, desktopLyricPlayedColor, desktopLyricPendingColor, desktopLyricStrokeColor, currentTrack?.id, currentTrack?.title, currentTrack?.artist, currentTrack?.album, currentTrack?.cover, resolvedCurrentCover, activeLyricIndex, currentLyrics, currentTime, translationEnabled, isPlaying]);
+  }, [desktopLyricOpen, desktopLyricLocked, desktopLyricDoubleLine, desktopLyricShowTranslation, desktopLyricWordByWord, desktopLyricSwitchAnimation, desktopLyricFontSize, desktopLyricSecondLineSize, desktopLyricFontWeight, desktopLyricPlayedColor, desktopLyricPendingColor, desktopLyricStrokeColor, currentTrack?.id, currentTrack?.title, currentTrack?.artist, currentTrack?.album, currentTrack?.cover, currentTrack?.duration, resolvedCurrentCover, activeLyricIndex, currentLyrics, currentTime, lyricTimeOffset, translationEnabled, isPlaying]);
 
   const appendImportedTracks = (
     imported: ImportedTrackResult[],
@@ -4490,9 +4672,9 @@ export default function App() {
     const gridClassName = "grid-cols-[18px_64px_1.3fr_1fr_74px_68px]";
     const virtualItems: VirtualTrackItem[] = [];
     visible.forEach((track, index) => {
-      const letter = getTrackAlphaLetter(track, sortKey);
-      const previousLetter = index > 0 ? getTrackAlphaLetter(visible[index - 1], sortKey) : "";
-      if (letter !== previousLetter) {
+      const letter = getTrackSectionLabel(track, sortKey);
+      const previousLetter = index > 0 ? getTrackSectionLabel(visible[index - 1], sortKey) : "";
+      if (letter && letter !== previousLetter) {
         virtualItems.push({ type: "alpha", key: `alpha-${pageKey}-${letter}`, letter });
       }
       virtualItems.push({ type: "track", key: track.id, track, index });
@@ -4501,10 +4683,7 @@ export default function App() {
     return (
       <motion.section key={pageKey} {...PAGE_ANIMATION} transition={{ duration: 0.22 }}>
         <header className="mb-4 flex items-center justify-between gap-3">
-          <div>
-            <h1 className="text-4xl font-black">{title}</h1>
-            <p className="text-sm text-[var(--dim)]">{visible.length} / {total} 首</p>
-          </div>
+          <PageTitle title={title} count={visible.length} />
           <div className="flex flex-wrap items-center justify-end gap-2">
             <button
               onClick={() => applyPlayQueue(visible, "sequential")}
@@ -4562,7 +4741,9 @@ export default function App() {
                     ["album", "专辑", "Alt+3"],
                     ["year", "年份", "Alt+4"],
                     ["duration", "时长", "Alt+5"],
-                    ["filePath", "文件路径", "Alt+6"]
+                    ["fileName", "文件名", "Alt+6"],
+                    ["modifiedAt", "文件修改时间", "Alt+7"],
+                    ["fileSize", "文件大小", "Alt+8"]
                   ].map(([key, label, hotkey]) => (
                     <button
                       key={key}
@@ -4704,7 +4885,7 @@ export default function App() {
     <div className="space-y-5 rounded-xl bg-[var(--surface)]/65 p-5">
       <div>
         <h2 className="text-xl font-bold">关于 Still</h2>
-        <p className="mt-1 text-sm text-[var(--dim)]">版本 1.0.0-beta.1</p>
+        <p className="mt-1 text-sm text-[var(--dim)]">版本 1.0.0-beta.2</p>
       </div>
       <p className="text-sm leading-6 text-[var(--dim)]">
         Still 是一个本地音乐播放器，支持本地音乐库、播放队列、专辑与艺术家浏览、全屏歌词、桌面歌词、系统托盘、任务栏媒体控制和系统媒体传输控制。
@@ -4734,7 +4915,7 @@ export default function App() {
       {view === "artists" && (
         <motion.section key="artists" {...PAGE_ANIMATION} transition={{ duration: 0.22 }}>
           <header className="mb-4 flex items-center justify-between">
-            <h1 className="text-4xl font-black">艺术家</h1>
+            <PageTitle title="艺术家" count={filteredArtists.length} />
             <div className="flex w-[320px] items-center rounded-lg border border-[var(--line)] px-3">
               <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current text-[var(--dim)]"><path d="M10 2a8 8 0 1 0 5.29 14l4.35 4.35 1.41-1.41-4.35-4.35A8 8 0 0 0 10 2zm0 2a6 6 0 1 1 0 12 6 6 0 0 1 0-12z" /></svg>
               <input
@@ -4773,8 +4954,7 @@ export default function App() {
               {renderAlbumCover(selectedArtistLatestSong.cover, selectedArtistEntity.name, 360, 360, "rounded-2xl")}
             </div>
           )}
-          <h1 className="text-4xl font-black">{selectedArtistEntity.name}</h1>
-          <p className="mt-1 text-[var(--dim)]">{selectedArtistEntity.songs.length} 首歌曲 · {selectedArtistEntity.albums.length} 张专辑</p>
+          <PageTitle title={selectedArtistEntity.name} count={selectedArtistEntity.songs.length} />
 
           <div className="mt-6 mb-4 flex items-center justify-between">
             <div className="inline-flex rounded-xl border border-[var(--line)] bg-[var(--bg-soft)] p-1 text-sm">
@@ -4848,7 +5028,7 @@ export default function App() {
       {view === "albums" && (
         <motion.section key="albums" {...PAGE_ANIMATION} transition={{ duration: 0.22 }}>
           <header className="mb-4 flex items-center justify-between">
-            <h1 className="text-4xl font-black">专辑</h1>
+            <PageTitle title="专辑" count={filteredAlbums.length} />
             <div className="flex w-[320px] items-center rounded-lg border border-[var(--line)] px-3">
               <svg viewBox="0 0 24 24" className="h-4 w-4 fill-current text-[var(--dim)]"><path d="M10 2a8 8 0 1 0 5.29 14l4.35 4.35 1.41-1.41-4.35-4.35A8 8 0 0 0 10 2zm0 2a6 6 0 1 1 0 12 6 6 0 0 1 0-12z" /></svg>
               <input
@@ -4878,7 +5058,7 @@ export default function App() {
               {renderAlbumCover(selectedAlbumEntity.cover, selectedAlbumEntity.name, 360, 360)}
             </div>
             <div>
-              <h1 className="text-4xl font-black">{selectedAlbumEntity.name}</h1>
+              <PageTitle title={selectedAlbumEntity.name} count={selectedAlbumSongs.length} />
               <p className="mt-2 text-[var(--dim)]">年份 {selectedAlbumEntity.year}</p>
               <div className="mt-3 flex flex-wrap gap-2">
                 {selectedAlbumEntity.artists.map((artist) => (
@@ -4929,7 +5109,7 @@ export default function App() {
 
       {view === "folders" && (
         <motion.section key="folders" {...PAGE_ANIMATION} transition={{ duration: 0.22 }}>
-          <h1 className="mb-5 text-4xl font-black">文件夹</h1>
+          <PageTitle title="文件夹" count={folderTree.length} className="mb-5" />
           <div className="space-y-2">
             {folderTree.map((node) => renderFolderNode(node))}
             {!folderTree.length && <p className="rounded-xl border border-dashed border-[var(--line)] px-4 py-8 text-center text-sm text-[var(--dim)]">暂无文件夹</p>}
@@ -4950,7 +5130,7 @@ export default function App() {
       {view === "playlists" && (
         <motion.section key="playlists" {...PAGE_ANIMATION} transition={{ duration: 0.22 }}>
           <header className="mb-4 flex items-center justify-between">
-            <h1 className="text-4xl font-black">歌单</h1>
+            <PageTitle title="歌单" count={playlists.length} />
             <IconButton label="新建歌单" onClick={createPlaylist} className="border border-[var(--line)] text-[var(--accent)]">
               <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current"><path d="M19 11h-6V5h-2v6H5v2h6v6h2v-6h6z" /></svg>
             </IconButton>
@@ -5008,7 +5188,7 @@ export default function App() {
 
       {view === "library" && (
         <motion.section key="library" {...PAGE_ANIMATION} transition={{ duration: 0.22 }}>
-          <h1 className="mb-6 text-4xl font-black">音乐库</h1>
+          <PageTitle title="音乐库" count={libraryStats.songs} className="mb-6" />
           <div
             onDragEnter={(event) => {
               event.preventDefault();
@@ -5045,7 +5225,6 @@ export default function App() {
             </button>
           </div>
           <div className="space-y-3">
-            <button className="w-full rounded-xl bg-[var(--surface)]/65 px-4 py-3 text-left">自定义文件夹</button>
             {unreadableTracks.length > 0 && (
               <button
                 type="button"
@@ -5066,7 +5245,7 @@ export default function App() {
 
       {view === "settings" && (
         <motion.section key="settings" {...PAGE_ANIMATION} transition={{ duration: 0.22 }}>
-          <h1 className="mb-6 text-4xl font-black">设置</h1>
+          <PageTitle title="设置" className="mb-6" />
           <div className="grid grid-cols-[180px_1fr] gap-4">
             <div className="rounded-xl bg-[var(--surface)]/60 p-2">
               {[
@@ -5092,13 +5271,21 @@ export default function App() {
                   <label className="flex items-center justify-between rounded-xl bg-[var(--surface)]/65 px-4 py-3">
                     <span>主题模式</span>
                     <IconButton
-                      label="切换主题"
-                      onClick={() => setTheme((prev) => (prev === "dark" ? "light" : "dark"))}
+                      label={themePreference === "system" ? "跟随系统" : themePreference === "dark" ? "深色模式" : "浅色模式"}
+                      onClick={() => setTheme((prev) => (prev === "system" ? "dark" : prev === "dark" ? "light" : "system"))}
                       className="h-9 w-9 border border-[var(--line)]"
                     >
-                      {theme === "dark"
-                        ? <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current"><path d="M12 4a1 1 0 0 0 1-1V1h-2v2a1 1 0 0 0 1 1zm0 16a1 1 0 0 0-1 1v2h2v-2a1 1 0 0 0-1-1zm8-8a1 1 0 0 0 1 1h2v-2h-2a1 1 0 0 0-1 1zM1 13h2a1 1 0 0 0 0-2H1v2zm16.95-5.54 1.42-1.41-1.42-1.42-1.41 1.42 1.41 1.41zM4.63 19.37l1.42 1.42 1.41-1.42-1.41-1.41-1.42 1.41zM19.37 19.37l-1.42-1.41-1.41 1.41 1.41 1.42 1.42-1.42zM4.63 4.63 3.21 6.05l1.42 1.41 1.42-1.41-1.42-1.42zM12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10z" /></svg>
-                        : <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current"><path d="M20.6 14.8A8.5 8.5 0 0 1 9.2 3.4 9.5 9.5 0 1 0 20.6 14.8z" /></svg>}
+                      {themePreference === "system"
+                        ? (
+                          <LineIcon>
+                            <rect x="2" y="3" width="20" height="14" rx="2" />
+                            <path d="M8 21h8" />
+                            <path d="M12 17v4" />
+                          </LineIcon>
+                        )
+                        : theme === "dark"
+                        ? <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current"><path d="M20.6 14.8A8.5 8.5 0 0 1 9.2 3.4 9.5 9.5 0 1 0 20.6 14.8z" /></svg>
+                        : <svg viewBox="0 0 24 24" className="h-5 w-5 fill-current"><path d="M12 4a1 1 0 0 0 1-1V1h-2v2a1 1 0 0 0 1 1zm0 16a1 1 0 0 0-1 1v2h2v-2a1 1 0 0 0-1-1zm8-8a1 1 0 0 0 1 1h2v-2h-2a1 1 0 0 0-1 1zM1 13h2a1 1 0 0 0 0-2H1v2zm16.95-5.54 1.42-1.41-1.42-1.42-1.41 1.42 1.41 1.41zM4.63 19.37l1.42 1.42 1.41-1.42-1.41-1.41-1.42 1.41zM19.37 19.37l-1.42-1.41-1.41 1.41 1.41 1.42 1.42-1.42zM4.63 4.63 3.21 6.05l1.42 1.41 1.42-1.41-1.42-1.42zM12 7a5 5 0 1 0 0 10 5 5 0 0 0 0-10z" /></svg>}
                     </IconButton>
                   </label>
                   <div className="rounded-xl bg-[var(--surface)]/65 px-4 py-3">
@@ -5291,7 +5478,7 @@ export default function App() {
               {false && (
                 <div className="space-y-4 rounded-xl bg-[var(--surface)]/65 p-5">
                   <h2 className="text-xl font-bold">关于</h2>
-                  <p>Still 1.0.0-beta.1</p>
+                  <p>Still 1.0.0-beta.2</p>
                   <p className="text-sm text-[var(--dim)]">本地音乐播放器，Material 风格界面，支持歌词、多模式全屏、桌面歌词与播放队列。</p>
                   <p className="text-sm text-[var(--dim)]">技术栈：React + Vite + Tailwind CSS + Framer Motion</p>
                 </div>
@@ -5305,7 +5492,7 @@ export default function App() {
         <motion.section key="track-info" {...PAGE_ANIMATION} transition={{ duration: 0.22 }}>
           <div className="mb-5 flex items-center justify-between gap-3">
             <div>
-              <h1 className="text-4xl font-black">音轨信息</h1>
+              <PageTitle title="音轨信息" />
               <p className="mt-1 text-sm text-[var(--dim)]">查看音乐库记录、文件属性与音频编码信息</p>
             </div>
             {trackInfo.localPath && (
@@ -5404,7 +5591,7 @@ export default function App() {
         >
           <div className="flex items-center gap-3" style={{ WebkitAppRegion: "no-drag" } as any}>
             <img src={theme === "dark" ? stillLogoBlack : stillLogoWhite} alt="Still" className="h-7 w-7 rounded-md object-contain" />
-            <p className="text-[24px] font-black leading-none tracking-tight">Still <span className="text-sm font-semibold text-[var(--dim)]">1.0.0-beta.1</span></p>
+            <p className="text-[24px] font-black leading-none tracking-tight">Still <span className="text-sm font-semibold text-[var(--dim)]">1.0.0-beta.2</span></p>
             {warnOnMetaMissing && view === "songs" && unreadableTracks.length > 0 && (
               <button
                 type="button"
@@ -5540,15 +5727,15 @@ export default function App() {
         )}
 
         <AnimatePresence>
-          {trackAlphaBubble.visible && availableAlphaLetters.length > 0 && !lyricsOpen && (
+          {trackAlphaBubble.visible && currentAlphaTracks.length > 0 && !lyricsOpen && (
             <motion.div
               initial={{ opacity: 0, scale: 0.88 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.88 }}
               transition={{ duration: 0.14 }}
-              className="pointer-events-none fixed z-[91] grid h-14 w-14 place-items-center rounded-full bg-[var(--surface)]/95 text-2xl font-black shadow-2xl backdrop-blur"
+              className="pointer-events-none fixed z-[91] grid h-14 min-w-14 place-items-center whitespace-nowrap rounded-full bg-[var(--surface)]/95 px-4 text-lg font-black shadow-2xl backdrop-blur"
               style={{
-                left: Math.max(12, trackAlphaBubble.x - 28),
+                left: Math.max(12, Math.min(window.innerWidth - 140, trackAlphaBubble.x - (trackAlphaBubble.letter.length > 2 ? 64 : 28))),
                 top: Math.max(12, Math.min(window.innerHeight - 68, trackAlphaBubble.y - 28))
               }}
             >
@@ -5574,16 +5761,14 @@ export default function App() {
                 onClick={(e) => e.stopPropagation()}
                 className="w-[min(720px,92vw)] rounded-2xl bg-[var(--bg-soft)]/92 p-8 shadow-2xl backdrop-blur"
               >
-                <div className="grid grid-cols-7 gap-3 sm:grid-cols-9">
-                  {TRACK_ALPHA_LETTERS.map((letter) => {
-                    const enabled = availableAlphaLetters.includes(letter);
+                <div className="grid grid-cols-4 gap-3 sm:grid-cols-7">
+                  {availableAlphaLetters.map((letter) => {
                     return (
                       <button
                         key={letter}
                         type="button"
-                        disabled={!enabled}
                         onClick={() => scrollToTrackAlphaLetter(letter)}
-                        className={`grid h-14 place-items-center rounded-xl text-2xl font-black transition ${enabled ? "hover:bg-[var(--surface)] text-[var(--text)]" : "cursor-not-allowed text-[var(--dim)]/35"}`}
+                        className="grid h-14 place-items-center rounded-xl text-xl font-black text-[var(--text)] transition hover:bg-[var(--surface)]"
                       >
                         {letter}
                       </button>
@@ -5610,7 +5795,7 @@ export default function App() {
               setCustomScrollbarDragging(true);
               mainPointerRef.current = { x: event.clientX, y: event.clientY };
               scrollMainFromScrollbarY(event.clientY);
-              if (availableAlphaLetters.length) showTrackAlphaBubble(getCurrentTrackAlphaLetter());
+              if (currentAlphaTracks.length) showTrackAlphaBubble(getCurrentTrackAlphaLetter());
             }}
           >
             <div

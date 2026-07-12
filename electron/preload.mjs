@@ -34,6 +34,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     update: (payload) => ipcRenderer.invoke("desktop-lyrics:update", payload),
     setLocked: (locked) => ipcRenderer.invoke("desktop-lyrics:set-locked", locked),
     sendCommand: (command) => ipcRenderer.send("desktop-lyrics:command", command),
+    dragStart: (point) => ipcRenderer.send("desktop-lyrics:drag-start", point),
+    dragMove: (point) => ipcRenderer.send("desktop-lyrics:drag-move", point),
+    dragEnd: () => ipcRenderer.send("desktop-lyrics:drag-end"),
+    controlsHover: (active) => ipcRenderer.send("desktop-lyrics:controls-hover", active),
     onData: (callback) => {
       const listener = (_, value) => callback(value);
       ipcRenderer.on("desktop-lyrics:data", listener);
