@@ -371,9 +371,9 @@ function LineIcon({ children, className = "h-5 w-5" }: { children: ReactNode; cl
 function PageTitle({ title, count, className = "" }: { title: ReactNode; count?: number | string; className?: string }) {
   return (
     <div className={`flex min-w-0 items-baseline gap-4 ${className}`}>
-      <h1 className="min-w-0 truncate text-[36px] font-black leading-none tracking-normal sm:text-[42px]">{title}</h1>
+      <h1 className="min-w-0 truncate text-[36px] font-black leading-tight tracking-normal sm:text-[42px]">{title}</h1>
       {count !== undefined && count !== "" && (
-        <span className="shrink-0 text-[24px] font-semibold leading-none tracking-normal text-[var(--dim)] sm:text-[28px]">
+        <span className="shrink-0 text-[24px] font-semibold leading-tight tracking-normal text-[var(--dim)] sm:text-[28px]">
           {count}
         </span>
       )}
@@ -1699,6 +1699,20 @@ function getLyricWordProgressAt(lines: LyricLine[], lineIndex: number, time: num
   return 1;
 }
 
+function getLyricWordEndAt(lines: LyricLine[], lineIndex: number, wordIndex: number, duration = 0) {
+  const line = lines[lineIndex];
+  const word = line?.words?.[wordIndex];
+  if (!word) return 0;
+  const candidates = [
+    word.endTime,
+    line?.words?.[wordIndex + 1]?.time,
+    lines[lineIndex + 1]?.time,
+    duration
+  ];
+  const end = candidates.find((value) => Number.isFinite(value) && Number(value) > word.time);
+  return Number(end ?? word.time + 0.6);
+}
+
 function splitLyricWordUnits(text: string) {
   if (containsCjk(text)) {
     const units: string[] = [];
@@ -2501,10 +2515,16 @@ export default function App() {
       const lines = currentLyricsRef.current;
       const lyricIndex = getActiveLyricIndexAt(lines, lyricTime);
       const activeRow = lyricRowRefs.current[lyricIndex];
-      const activeWord = activeRow?.querySelector<HTMLElement>(".lyric-word-sweep");
-      if (activeWord) {
-        const progress = getLyricWordProgressAt(lines, lyricIndex, lyricTime, currentTrackDurationRef.current) * 100;
-        activeWord.style.setProperty("--lyric-word-progress", `${progress}%`);
+      const line = lines[lyricIndex];
+      const activeWords = activeRow?.querySelectorAll<HTMLElement>(".lyric-word-piece");
+      if (line?.words?.length && activeWords?.length) {
+        activeWords.forEach((node, index) => {
+          const word = line.words?.[index];
+          if (!word) return;
+          const endTime = getLyricWordEndAt(lines, lyricIndex, index, currentTrackDurationRef.current);
+          const progress = Math.max(0, Math.min(1, (lyricTime - word.time) / Math.max(0.08, endTime - word.time)));
+          node.style.setProperty("--lyric-word-position", `${100 - progress * 100}%`);
+        });
       }
       const reportInterval = desktopLyricOpen && desktopLyricWordByWord === "auto" ? 0.033 : 0.1;
       if (lyricIndex !== activeLyricIndexRef.current || Math.abs(next - lastReported) >= reportInterval) {
@@ -4528,18 +4548,37 @@ export default function App() {
     if (!active || lyricWordAnimation !== "auto" || !line.words?.length) return line.text;
     const activeColor = theme === "dark" ? "#ffffff" : "#0f172a";
     const pendingColor = theme === "dark" ? "rgba(255,255,255,0.42)" : "rgba(15,23,42,0.42)";
-    const progress = getLyricWordProgress(line, lineIndex) * 100;
+    const lyricTime = currentTime + lyricTimeOffset;
+    const timedText = line.words.map((word) => word.text).join("");
+    const tail = line.text.startsWith(timedText) ? line.text.slice(timedText.length) : "";
 
     return (
-      <span
-        className="lyric-word-sweep"
-        style={{
-          ["--lyric-word-progress" as string]: `${progress}%`,
-          ["--lyric-word-active" as string]: activeColor,
-          ["--lyric-word-pending" as string]: pendingColor
-        }}
-      >
-        {line.text}
+      <span className="lyric-word-segments">
+        {line.words.map((word, index) => {
+          const endTime = getLyricWordEndAt(currentLyrics, lineIndex, index, currentTrack?.duration || 0);
+          const progress = Math.max(0, Math.min(1, (lyricTime - word.time) / Math.max(0.08, endTime - word.time)));
+          return (
+            <span
+              key={`${word.time}-${index}-${word.text}`}
+              className="lyric-word-piece"
+              style={{
+                ["--lyric-word-position" as string]: `${100 - progress * 100}%`,
+                ["--lyric-word-active" as string]: activeColor,
+                ["--lyric-word-pending" as string]: pendingColor
+              }}
+            >
+              {word.text}
+            </span>
+          );
+        })}
+        {tail ? (
+          <span
+            className="lyric-word-tail"
+            style={{ ["--lyric-word-pending" as string]: pendingColor }}
+          >
+            {tail}
+          </span>
+        ) : null}
       </span>
     );
   };
@@ -5695,7 +5734,7 @@ export default function App() {
                       alt={playlist.name}
                       className="h-8 w-8 rounded object-cover"
                     />
-                    <span className="truncate">{playlist.name}</span>
+                    <span className="truncate leading-snug">{playlist.name}</span>
                   </button>
                 ))}
               </div>
@@ -5921,8 +5960,16 @@ export default function App() {
               >
                 源
               </button>
+              <AnimatePresence>
               {lyricSourceMenuOpen && hasLyricSources && currentTrack && (
-                <div className="absolute bottom-10 right-0 z-[97] w-52 overflow-hidden rounded-xl bg-[var(--bg-soft)] p-1 shadow-2xl">
+                <motion.div
+                  initial={{ opacity: 0, y: 8, scale: 0.98 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 8, scale: 0.98 }}
+                  transition={{ duration: 0.16 }}
+                  className="absolute bottom-10 right-0 z-[97] w-52 overflow-hidden rounded-2xl border border-[var(--line)]/70 bg-[var(--bg-soft)]/95 p-1.5 shadow-2xl backdrop-blur"
+                  onClick={(e) => e.stopPropagation()}
+                >
                   {currentTrack.lyricSources.map((source) => (
                     <button
                       key={source.id}
@@ -5940,8 +5987,9 @@ export default function App() {
                       <span className="text-xs text-[var(--dim)]">{source.kind === "local" ? "本地" : "内嵌"}</span>
                     </button>
                   ))}
-                </div>
+                </motion.div>
               )}
+              </AnimatePresence>
             </div>
             <button
               disabled={!hasTranslation}
@@ -5960,13 +6008,14 @@ export default function App() {
               >
                 {toRateText(playbackRate)}
               </button>
+              <AnimatePresence>
               {speedPanelOpen && (
                 <motion.div
                   initial={{ opacity: 0, y: 8, scale: 0.98 }}
                   animate={{ opacity: 1, y: 0, scale: 1 }}
                   exit={{ opacity: 0, y: 8, scale: 0.98 }}
                   transition={{ duration: 0.16 }}
-                  className="absolute bottom-12 right-0 z-[98] w-[560px] rounded-2xl bg-[var(--bg-soft)]/95 p-4 shadow-2xl backdrop-blur"
+                  className="absolute bottom-12 right-0 z-[98] w-[560px] rounded-2xl border border-[var(--line)]/70 bg-[var(--bg-soft)]/95 p-4 shadow-2xl backdrop-blur"
                 >
                   <div className="mb-4">
                     <p className="text-sm font-semibold">播放速度</p>
@@ -5983,6 +6032,7 @@ export default function App() {
                   />
                 </motion.div>
               )}
+              </AnimatePresence>
             </div>
             <div className="relative" onClick={(e) => e.stopPropagation()}>
               <IconButton
@@ -5994,13 +6044,14 @@ export default function App() {
                   ? <LineIcon><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" /><path d="m22 9-6 6" /><path d="m16 9 6 6" /></LineIcon>
                   : <LineIcon><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" /><path d="M15.5 8.5a5 5 0 0 1 0 7" /><path d="M18.5 5.5a9 9 0 0 1 0 13" /></LineIcon>}
               </IconButton>
+              <AnimatePresence>
               {volumePanelOpen && (
                 <motion.div
                   initial={{ opacity: 0, y: 8, scale: 0.98 }}
                   animate={{ opacity: 1, y: 0, scale: 1 }}
                   exit={{ opacity: 0, y: 8, scale: 0.98 }}
                   transition={{ duration: 0.16 }}
-                  className="volume-popover absolute bottom-12 right-0 z-[98] w-80 rounded-2xl bg-[var(--bg-soft)]/95 p-4 shadow-2xl backdrop-blur"
+                  className="volume-popover absolute bottom-12 right-0 z-[98] w-80 rounded-2xl border border-[var(--line)]/70 bg-[var(--bg-soft)]/95 p-4 shadow-2xl backdrop-blur"
                 >
                   <div className="flex items-center gap-3">
                     <IconButton
@@ -6039,6 +6090,7 @@ export default function App() {
                   </div>
                 </motion.div>
               )}
+              </AnimatePresence>
             </div>
           </div>
         </footer>
@@ -6321,10 +6373,11 @@ export default function App() {
         <AnimatePresence>
           {playlistContextMenu && playlistContextTarget && (
             <motion.div
-              initial={{ opacity: 0, scale: 0.96 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.96 }}
-              className="fixed z-[109] w-[220px] overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--bg-soft)]/95 p-1 shadow-2xl backdrop-blur"
+              initial={{ opacity: 0, y: 8, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 8, scale: 0.98 }}
+              transition={{ duration: 0.16 }}
+              className="fixed z-[109] w-[220px] overflow-hidden rounded-2xl border border-[var(--line)]/70 bg-[var(--bg-soft)]/95 p-1.5 shadow-2xl backdrop-blur"
               style={{ left: Math.min(playlistContextMenu.x, window.innerWidth - 240), top: Math.min(playlistContextMenu.y, window.innerHeight - 170) }}
               onClick={(e) => e.stopPropagation()}
             >
@@ -6352,10 +6405,11 @@ export default function App() {
           {contextMenu && contextTrack && (
             <motion.div
               key={`${contextMenu.x}-${contextMenu.y}-${contextMenu.trackIds.join("-")}`}
-              initial={{ opacity: 0, scale: 0.96 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.96 }}
-              className="fixed z-[110] w-[320px] rounded-xl bg-[var(--bg-soft)]/95 p-1.5 shadow-2xl backdrop-blur"
+              initial={{ opacity: 0, y: 8, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 8, scale: 0.98 }}
+              transition={{ duration: 0.16 }}
+              className="fixed z-[110] w-[320px] rounded-2xl border border-[var(--line)]/70 bg-[var(--bg-soft)]/95 p-1.5 shadow-2xl backdrop-blur"
               style={contextMenuPosition}
               onClick={(e) => e.stopPropagation()}
               onMouseLeave={() => setContextPlaylistSubmenuOpen(false)}
@@ -6378,8 +6432,15 @@ export default function App() {
                   <span className="flex items-center gap-2"><span className="w-4 text-[var(--accent)]">+</span>添加到歌单</span>
                   <span className="text-[var(--dim)]">›</span>
                 </button>
+                <AnimatePresence>
                 {contextPlaylistSubmenuOpen && (
-                  <div className={`absolute top-0 z-[111] w-56 rounded-xl bg-[var(--bg-soft)]/95 p-1 shadow-2xl ${contextMenuPosition.left > window.innerWidth - 600 ? "right-[100%] mr-1" : "left-[100%] ml-1"}`}>
+                  <motion.div
+                    initial={{ opacity: 0, x: contextMenuPosition.left > window.innerWidth - 600 ? 8 : -8, scale: 0.98 }}
+                    animate={{ opacity: 1, x: 0, scale: 1 }}
+                    exit={{ opacity: 0, x: contextMenuPosition.left > window.innerWidth - 600 ? 8 : -8, scale: 0.98 }}
+                    transition={{ duration: 0.14 }}
+                    className={`absolute top-0 z-[111] w-56 rounded-2xl border border-[var(--line)]/70 bg-[var(--bg-soft)]/95 p-1.5 shadow-2xl backdrop-blur ${contextMenuPosition.left > window.innerWidth - 600 ? "right-[100%] mr-1" : "left-[100%] ml-1"}`}
+                  >
                     {playlists.map((playlist) => (
                       <button
                         key={playlist.id}
@@ -6395,8 +6456,9 @@ export default function App() {
                       </button>
                     ))}
                   {!playlists.length && <p className="px-3 py-2 text-sm text-[var(--dim)]">暂无歌单</p>}
-                  </div>
+                  </motion.div>
                 )}
+                </AnimatePresence>
               </div>
               <button onClick={() => { insertTracksToQueue(contextTrackIds, "after-current"); setContextMenu(null); }} className="flex w-full items-center justify-between rounded-md px-3 py-2 text-left hover:bg-[var(--surface)]"><span>插播（当前播放后）</span><span className="text-xs text-[var(--dim)]">Ctrl+Enter</span></button>
               <button onClick={() => { insertTracksToQueue(contextTrackIds, "after-last"); setContextMenu(null); }} className="flex w-full items-center justify-between rounded-md px-3 py-2 text-left hover:bg-[var(--surface)]"><span>插播（上次插播后）</span><span className="text-xs text-[var(--dim)]">Shift+Enter</span></button>

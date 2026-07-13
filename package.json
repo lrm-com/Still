@@ -25,15 +25,10 @@
     ],
     "win": {
       "icon": "logo/Still_logo_white/Still_logo_white_rounded.ico",
+      "artifactName": "Still_v${version}.${ext}",
       "target": [
         {
           "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        },
-        {
-          "target": "portable",
           "arch": [
             "x64"
           ]

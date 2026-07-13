@@ -869,9 +869,9 @@ function createDesktopLyricWindow() {
     .locked:not(.idle) .top { opacity: 1; pointer-events: none; }
     .locked:not(.idle) .meta { opacity: 1; pointer-events: none; }
     .locked:not(.idle) .playback-controls, .locked:not(.idle) .window-controls, .locked:not(.idle) .playback-controls button, .locked:not(.idle) .window-controls button { opacity: 1; pointer-events: auto; }
-    .top { -webkit-app-region: no-drag; position: relative; display: flex; align-items: center; justify-content: space-between; gap: 12px; transition: opacity .16s ease; }
+    .top { -webkit-app-region: no-drag; position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(92px, 1fr); align-items: center; gap: 12px; min-width: 0; transition: opacity .16s ease; }
     .panel:not(.locked), .panel:not(.locked) .top, .panel:not(.locked) .lyrics-viewport { cursor: move; }
-    .meta { display: flex; align-items: center; min-width: 0; gap: 10px; }
+    .meta { display: flex; align-items: center; min-width: 0; max-width: 100%; gap: 10px; overflow: hidden; justify-self: start; }
     .cover-box { width: 40px; height: 40px; border-radius: 8px; background: rgba(255,255,255,.1); color: rgba(255,255,255,.66); display: grid; place-items: center; overflow: hidden; flex: 0 0 auto; }
     .cover-box img { width: 100%; height: 100%; object-fit: cover; display: block; }
     .cover-box svg { width: 22px; height: 22px; display: none; }
@@ -879,8 +879,8 @@ function createDesktopLyricWindow() {
     .cover-box.empty svg { display: block; }
     .title { font-size: 13px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .artist { margin-top: 2px; font-size: 11px; color: rgba(255,255,255,.66); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .playback-controls { -webkit-app-region: no-drag; position: absolute; left: 50%; top: 50%; display: flex; align-items: center; gap: 8px; transform: translate(-50%, -50%); }
-    .window-controls { -webkit-app-region: no-drag; display: flex; gap: 6px; margin-left: auto; }
+    .playback-controls { -webkit-app-region: no-drag; position: static; display: flex; align-items: center; justify-self: center; gap: 8px; transform: none; }
+    .window-controls { -webkit-app-region: no-drag; display: flex; justify-self: end; gap: 6px; margin-left: 0; }
     button { width: 28px; height: 28px; display: inline-grid; place-items: center; border-radius: 999px; border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.08); color: white; cursor: pointer; line-height: 1; padding: 0; }
     button svg { width: 16px; height: 16px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
     .playback-controls button { width: 30px; height: 30px; background: rgba(255,255,255,.1); }
@@ -898,7 +898,8 @@ function createDesktopLyricWindow() {
     .desktop-line.no-animation { transition: none !important; }
     .line-scroll { display: inline-block; max-width: none; white-space: nowrap; will-change: transform; transform: translate3d(0,0,0); backface-visibility: hidden; -webkit-text-stroke: 1px var(--stroke-color, rgba(0,0,0,.69)); paint-order: stroke fill; text-shadow: 1px 0 0 var(--stroke-color, rgba(0,0,0,.69)), -1px 0 0 var(--stroke-color, rgba(0,0,0,.69)), 0 1px 0 var(--stroke-color, rgba(0,0,0,.69)), 0 -1px 0 var(--stroke-color, rgba(0,0,0,.69)), 1px 1px 0 var(--stroke-color, rgba(0,0,0,.69)), -1px 1px 0 var(--stroke-color, rgba(0,0,0,.69)), 1px -1px 0 var(--stroke-color, rgba(0,0,0,.69)), -1px -1px 0 var(--stroke-color, rgba(0,0,0,.69)); }
     .line-scroll.word { -webkit-text-stroke: 0 transparent; text-shadow: none; }
-    .line-word { display: inline; white-space: pre; color: transparent; -webkit-text-fill-color: transparent; -webkit-text-stroke: 1px var(--stroke-color, rgba(0,0,0,.69)); paint-order: stroke fill; background-image: linear-gradient(90deg, var(--played-color, #00b7c3) 0%, var(--played-color, #00b7c3) 50%, var(--pending-color, #ccc) 50%, var(--pending-color, #ccc) 100%); background-size: 200% 100%; background-position-x: var(--word-position, 100%); background-clip: text; -webkit-background-clip: text; filter: drop-shadow(0 0 1px var(--stroke-color, rgba(0,0,0,.69))) drop-shadow(0 0 2px var(--stroke-color, rgba(0,0,0,.69))); transition: background-position-x .06s linear; }
+    .line-word { position: relative; z-index: 0; isolation: isolate; display: inline-block; white-space: pre; color: transparent; -webkit-text-fill-color: transparent; -webkit-text-stroke: 0 transparent; background-image: linear-gradient(90deg, var(--played-color, #00b7c3) 0%, var(--played-color, #00b7c3) 50%, var(--pending-color, #ccc) 50%, var(--pending-color, #ccc) 100%); background-size: 200% 100%; background-position-x: var(--word-position, 100%); background-clip: text; -webkit-background-clip: text; transition: background-position-x .06s linear; }
+    .line-word::before { content: attr(data-text); position: absolute; inset: 0; z-index: -1; color: transparent; -webkit-text-fill-color: transparent; -webkit-text-stroke: 1px var(--stroke-color, rgba(0,0,0,.69)); paint-order: stroke fill; pointer-events: none; }
     .line-word.with-motion { display: inline-block; transform: translateY(var(--word-lift, 0)) scale(var(--word-scale, 1)); transform-origin: center bottom; transition: background-position-x .06s linear, transform .06s linear; }
   </style>
 </head>
@@ -1110,6 +1111,7 @@ function createDesktopLyricWindow() {
           const node = document.createElement('span');
           node.className = 'line-word' + (spec.wordLiftEffect || spec.wordScaleEffect ? ' with-motion' : '');
           node.textContent = word.text || '';
+          node.dataset.text = word.text || '';
           paintWordNode(node, word, spec);
           entry.scroll.appendChild(node);
         });
