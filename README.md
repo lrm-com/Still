@@ -2,18 +2,14 @@
 
 <img src="logo/Still_logo/Still_logo.png" height="180" width="180" alt="Still logo" />
 
-# Still
-
-## 静听
-
-### 此刻有声
-
+<h1>Still</h1>
+<h2>静听</h2>
+<h3>此刻有声</h3>
 Still 是一个基于 React、Vite 和 Electron 构建的本地桌面音乐播放器，专注于本地音乐库管理、沉浸式歌词、桌面歌词和轻量顺手的播放体验。
 
 [下载最新版本](https://github.com/lrm-com/Still/releases)
 
 </div>
-
 ## 当前版本
 
 `1.0.0-beta.2`
